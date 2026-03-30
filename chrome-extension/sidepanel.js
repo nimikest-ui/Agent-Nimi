@@ -32,7 +32,7 @@ async function refreshContext() {
   activeTabId = tab.id;
   chrome.runtime.sendMessage({ type: "get_last_context", tabId: tab.id }, (resp) => {
     if (!resp?.ok || !resp.context) {
-      contextMetaEl.textContent = "No synced context yet. Open a TDXArena challenge tab.";
+      contextMetaEl.textContent = "No context synced yet. Navigate to any page.";
       return;
     }
     const c = resp.context;
