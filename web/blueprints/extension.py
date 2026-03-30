@@ -21,7 +21,7 @@ def _cors(resp):
 
 
 def _context_block(ctx: dict, max_chars: int = 8000) -> str:
-    """Build compact context block injected into extension chat prompts."""
+    """Build compact context block injected into the agent's user message."""
     title = str(ctx.get("title", "")).strip()
     page_url = str(ctx.get("url", "")).strip()
     main_text = str(ctx.get("text", "")).strip()
@@ -35,11 +35,13 @@ def _context_block(ctx: dict, max_chars: int = 8000) -> str:
     text = main_text[:max_chars]
     snippet_lines = "\n".join(f"- {s[:300]}" for s in snippets[:8])
     form_lines = "\n".join(
-        f"- form action={f.get('action','')} inputs={[i.get('name','') for i in f.get('inputs',[])]} "
+        f"- form action={f.get('action', '')} "
+        f"inputs={[i.get('name', '') for i in f.get('inputs', [])]}"
         for f in forms[:5]
     )
-    link_lines = "\n".join(f"- [{l.get('text','')}]({l.get('href','')})" for l in links[:15])
-
+    link_lines = "\n".join(
+        f"- [{l.get('text', '')}]({l.get('href', '')})" for l in links[:15]
+    )
     return (
         "[PAGE CONTEXT]\n"
         f"Title: {title}\n"
@@ -49,34 +51,6 @@ def _context_block(ctx: dict, max_chars: int = 8000) -> str:
         f"Forms:\n{form_lines or '- none'}\n\n"
         f"Links:\n{link_lines or '- none'}\n"
     )
-
-
-def _coach_messages(user_msg: str, ctx_block: str) -> list[dict]:
-    """Build extension chat prompt sequence."""
-    system = (
-        "You are AgentNimi — a sharp, capable AI sidekick with FULL BROWSER AWARENESS.\n"
-        "You can see everything on the current page: its full text, code blocks, forms, links, and URL.\n"
-        "You help with anything the user needs — research, coding, writing, debugging, hacking, shopping, whatever.\n"
-        "\n"
-        "CAPABILITIES YOU HAVE via the browser extension:\n"
-        "- Read the full page content (text, snippets, forms, links)\n"
-        "- Know the exact URL and page title\n"
-        "- Observe form fields (names, types, current values)\n"
-        "- See all code blocks rendered on the page\n"
-        "- Instruct the user to click specific elements (by CSS selector)\n"
-        "- Instruct the user to fill inputs or submit forms\n"
-        "- Scroll to specific sections\n"
-        "\n"
-        "RULES:\n"
-        "- Be concise and direct. No fluff, no disclaimers.\n"
-        "- Reference specific page elements (forms, links, code) when relevant.\n"
-        "- If the user asks you to do something on the page, give them the exact selector/step.\n"
-        "- Help with whatever they need — no topic restrictions.\n"
-    )
-    return [
-        {"role": "system", "content": system},
-        {"role": "user", "content": ctx_block + "\n[USER]\n" + user_msg},
-    ]
 
 
 @extension_bp.route("/health", methods=["GET", "OPTIONS"])
@@ -101,6 +75,8 @@ def extension_context():
         "url": payload.get("url", ""),
         "text": payload.get("text", ""),
         "snippets": payload.get("snippets", []),
+        "forms": payload.get("forms", []),
+        "links": payload.get("links", []),
         "captured_at": datetime.datetime.now().isoformat(),
     }
     state.set_extension_context(tab_key, context)
@@ -110,7 +86,7 @@ def extension_context():
             "tab_key": tab_key[:80],
             "url": str(context.get("url", ""))[:200],
             "text_len": len(str(context.get("text", ""))),
-            "snippets": len(context.get("snippets", []) or []),
+            "snippets": len(context.get("snippets") or []),
         },
     )
     resp = jsonify({"ok": True, "tab_key": tab_key})
@@ -119,7 +95,11 @@ def extension_context():
 
 @extension_bp.route("/chat", methods=["POST", "OPTIONS"])
 def extension_chat():
-    """Stream coach responses for extension side panel chats."""
+    """Run extension chats through the real AgentNimi agent loop (tools included).
+
+    Creates a real conversation in the main web UI and streams all agent events
+    (tool calls, results, reasoning traces) back to the extension side panel.
+    """
     if request.method == "OPTIONS":
         return _cors(Response(status=204))
     if not state.agent:
@@ -136,7 +116,42 @@ def extension_chat():
 
     ext_conf = (state.config or {}).get("extension", {})
     max_ctx = int(ext_conf.get("max_context_chars", 8000) or 8000)
-    messages = _coach_messages(user_msg, _context_block(ext_ctx, max_chars=max_ctx))
+
+    # Prepend page context so the agent knows what page the user is on
+    ctx_block = _context_block(ext_ctx, max_chars=max_ctx) if ext_ctx else ""
+    full_msg = (ctx_block + "\n" + user_msg).strip() if ctx_block else user_msg
+
+    # ── Create a real conversation visible in the main web UI ──────────────────
+    from web.services import conversation_service
+    from config import SYSTEM_PROMPT
+    from core.session_memory import start_engagement, add_finding
+
+    conv_id = str(uuid.uuid4())
+    page_title = ext_ctx.get("title", "") if ext_ctx else ""
+    raw_title = f"[Browser] {page_title}: {user_msg}" if page_title else f"[Browser] {user_msg}"
+    conv_title = conversation_service.generate_title(raw_title)
+    conv_data = {
+        "id": conv_id,
+        "title": conv_title,
+        "created_at": datetime.datetime.now().isoformat(),
+        "updated_at": datetime.datetime.now().isoformat(),
+        "messages": [],
+        "source": "extension",
+    }
+    conversation_service.save_conversation(conv_id, conv_data)
+
+    # Reset agent to a fresh conversation context
+    state.agent.messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+    state.set_current_conv_id(conv_id)
+    start_engagement(conv_id, conv_title)
+
+    # Persist the user message (store the clean version, not the context-prefixed one)
+    conv_data["messages"].append({
+        "role": "user",
+        "content": user_msg,
+        "timestamp": datetime.datetime.now().isoformat(),
+    })
+    conversation_service.save_conversation(conv_id, conv_data)
 
     q = state.get_session(session_id)
 
@@ -150,18 +165,20 @@ def extension_chat():
 
     def run_agent():
         try:
-            result = state.agent.provider.chat(messages, stream=True)
-            chunks = []
-            if isinstance(result, str):
-                chunks.append(result)
-                stream_callback(result)
-            else:
-                for chunk in result:
-                    text = str(chunk)
-                    chunks.append(text)
-                    stream_callback(text)
-            response = "".join(chunks)
-            q.put({"type": "done", "content": response})
+            # Full agent loop — nmap, shell, subdomains, all tools available
+            response = state.agent.chat(full_msg, stream_callback=stream_callback)
+
+            q.put({"type": "done", "content": response, "conversation_id": conv_id})
+
+            # Persist assistant response
+            conv_data["messages"].append({
+                "role": "assistant",
+                "content": response,
+                "timestamp": datetime.datetime.now().isoformat(),
+            })
+            conversation_service.save_conversation(conv_id, conv_data)
+            add_finding(conv_id, response[:3000])
+            audit_event("extension_chat_complete", {"conversation_id": conv_id})
         except Exception as e:
             q.put({"type": "error", "message": str(e)})
         finally:
@@ -171,6 +188,8 @@ def extension_chat():
     thread.start()
 
     def generate():
+        # Immediately emit conversation_id so the side panel can show a link
+        yield f"data: {json.dumps({'type': 'conversation_id', 'conversation_id': conv_id})}\n\n"
         waited = 0
         deadline = 600
         while waited < deadline:

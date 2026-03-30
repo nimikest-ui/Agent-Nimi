@@ -43,6 +43,22 @@ async function refreshContext() {
 
 function onStreamEvent(ev) {
   const type = ev?.type || "";
+
+  if (type === "conversation_id") {
+    // Show a link to open the full conversation in the main UI
+    const convId = ev.conversation_id;
+    const existing = document.getElementById("conv-link");
+    if (existing) existing.remove();
+    const link = document.createElement("a");
+    link.id = "conv-link";
+    link.href = `http://127.0.0.1:1337/?conv=${convId}`;
+    link.target = "_blank";
+    link.textContent = "↗ View full session in AgentNimi";
+    link.style.cssText = "display:block;margin:6px 8px;font-size:11px;color:#7dd3fc;text-decoration:underline;";
+    messagesEl.before(link);
+    return;
+  }
+
   if (type === "chunk" || type === "text_chunk") {
     if (!currentAssistantEl) currentAssistantEl = appendMessage("assistant", "");
     currentAssistantEl.textContent += String(ev.content || ev.text || "");
