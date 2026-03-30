@@ -7,6 +7,7 @@ const contextMetaEl = document.getElementById("context-meta");
 let activeTabId = null;
 let currentAssistantEl = null;
 let streaming = false;
+let pendingConvId = null;
 
 function appendMessage(role, text) {
   const el = document.createElement("div");
@@ -45,17 +46,8 @@ function onStreamEvent(ev) {
   const type = ev?.type || "";
 
   if (type === "conversation_id") {
-    // Show a link to open the full conversation in the main UI
-    const convId = ev.conversation_id;
-    const existing = document.getElementById("conv-link");
-    if (existing) existing.remove();
-    const link = document.createElement("a");
-    link.id = "conv-link";
-    link.href = `http://127.0.0.1:1337/?conv=${convId}`;
-    link.target = "_blank";
-    link.textContent = "↗ View full session in AgentNimi";
-    link.style.cssText = "display:block;margin:6px 8px;font-size:11px;color:#7dd3fc;text-decoration:underline;";
-    messagesEl.before(link);
+    // Store the conversation ID — we'll show the link when done
+    pendingConvId = ev.conversation_id;
     return;
   }
 
@@ -75,6 +67,19 @@ function onStreamEvent(ev) {
     sendBtn.disabled = false;
     updateStatus("connected");
     currentAssistantEl = null;
+    // Now show the link — agent is fully done, results are saved
+    if (pendingConvId) {
+      const existing = document.getElementById("conv-link");
+      if (existing) existing.remove();
+      const link = document.createElement("a");
+      link.id = "conv-link";
+      link.href = `http://127.0.0.1:1337/?conv=${pendingConvId}`;
+      link.target = "_blank";
+      link.textContent = "\u2197 View full session in AgentNimi";
+      link.style.cssText = "display:block;margin:6px 8px;font-size:12px;color:#7dd3fc;text-decoration:underline;font-weight:bold;";
+      messagesEl.after(link);
+      pendingConvId = null;
+    }
     return;
   }
 }
@@ -96,6 +101,10 @@ async function sendMessage() {
   if (!activeTabId) await refreshContext();
   appendMessage("user", text);
   inputEl.value = "";
+  // Clear old conversation link and reset state for new message
+  const oldLink = document.getElementById("conv-link");
+  if (oldLink) oldLink.remove();
+  pendingConvId = null;
   currentAssistantEl = appendMessage("assistant", "");
   streaming = true;
   sendBtn.disabled = true;

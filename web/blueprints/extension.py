@@ -44,8 +44,10 @@ def _context_block(ctx: dict, max_chars: int = 8000) -> str:
     )
     return (
         "[PAGE CONTEXT]\n"
+        f"ACTIVE_PAGE_URL: {page_url}\n"
+        f"ACTIVE_PAGE_DOMAIN: {page_url.split('/')[2] if '//' in page_url else page_url}\n"
         f"Title: {title}\n"
-        f"URL: {page_url}\n"
+        f"NOTE: When the user says 'this site', 'this page', or 'here', they mean ACTIVE_PAGE_DOMAIN above.\n\n"
         f"MainText:\n{text}\n\n"
         f"Code Snippets:\n{snippet_lines or '- none'}\n\n"
         f"Forms:\n{form_lines or '- none'}\n\n"
