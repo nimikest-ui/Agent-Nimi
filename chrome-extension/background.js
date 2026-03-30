@@ -50,7 +50,9 @@ async function pushContext(tabId, payload) {
       title: payload.title || "",
       url: payload.url || "",
       text: payload.text || "",
-      snippets: payload.snippets || []
+      snippets: payload.snippets || [],
+      forms: payload.forms || [],
+      links: payload.links || []
     })
   });
   if (!res.ok) {
@@ -65,6 +67,25 @@ function askTabForContext(tabId) {
   });
 }
 
+// ─── Execute browser action on the active tab ─────────────────────────────────
+
+async function executeBrowserAction(tabId, action) {
+  const [result] = await chrome.scripting.executeScript({
+    target: { tabId },
+    func: (action) => {
+      return new Promise((resolve) => {
+        chrome.runtime.sendMessage({ type: "browser_action", ...action }, (resp) => {
+          resolve(resp || { ok: false, error: "No response" });
+        });
+      });
+    },
+    args: [action]
+  });
+  return result?.result || { ok: false };
+}
+
+// ─── Lifecycle ────────────────────────────────────────────────────────────────
+
 chrome.runtime.onInstalled.addListener(async () => {
   await chrome.storage.local.set({ [API_BASE_KEY]: DEFAULT_API_BASE });
 });
@@ -74,8 +95,9 @@ chrome.action.onClicked.addListener(async (tab) => {
   await chrome.sidePanel.open({ tabId: tab.id });
 });
 
+// Sync context on ALL tab updates (not just TDXArena)
 chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
-  if (!tab?.url || !tab.url.startsWith("https://tdxarena.com/")) return;
+  if (!tab?.url || tab.url.startsWith("chrome://") || tab.url.startsWith("chrome-extension://")) return;
   if (changeInfo.status === "complete") {
     askTabForContext(tabId);
   }
@@ -83,15 +105,17 @@ chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
 
 chrome.tabs.onActivated.addListener(async ({ tabId }) => {
   const tab = await chrome.tabs.get(tabId);
-  if (tab?.url && tab.url.startsWith("https://tdxarena.com/")) {
+  if (tab?.url && !tab.url.startsWith("chrome://") && !tab.url.startsWith("chrome-extension://")) {
     askTabForContext(tabId);
   }
 });
 
+// ─── Message Router ───────────────────────────────────────────────────────────
+
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   if (!msg || !msg.type) return false;
 
-  if (msg.type === "tdx_context") {
+  if (msg.type === "page_context") {
     const tabId = sender.tab?.id;
     if (!tabId) {
       sendResponse({ ok: false, error: "No tab id" });
@@ -181,6 +205,21 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     }
     sendResponse({ ok: true, context: info.payload, ts: info.ts });
     return false;
+  }
+
+  // ─── Browser action proxy ─────────────────────────────────────────────────
+  if (msg.type === "do_browser_action") {
+    chrome.tabs.query({ active: true, currentWindow: true }, async (tabs) => {
+      const tabId = tabs[0]?.id;
+      if (!tabId) { sendResponse({ ok: false, error: "No active tab" }); return; }
+      try {
+        const result = await executeBrowserAction(tabId, msg.action || {});
+        sendResponse(result);
+      } catch (err) {
+        sendResponse({ ok: false, error: String(err.message || err) });
+      }
+    });
+    return true;
   }
 
   return false;

@@ -29,31 +29,54 @@ def _context_block(ctx: dict, max_chars: int = 8000) -> str:
     if not isinstance(snippets, list):
         snippets = []
     snippets = [str(s).strip() for s in snippets if str(s).strip()]
+    forms = ctx.get("forms") or []
+    links = ctx.get("links") or []
+
     text = main_text[:max_chars]
     snippet_lines = "\n".join(f"- {s[:300]}" for s in snippets[:8])
+    form_lines = "\n".join(
+        f"- form action={f.get('action','')} inputs={[i.get('name','') for i in f.get('inputs',[])]} "
+        for f in forms[:5]
+    )
+    link_lines = "\n".join(f"- [{l.get('text','')}]({l.get('href','')})" for l in links[:15])
+
     return (
-        "[TDXARENA CONTEXT]\n"
+        "[PAGE CONTEXT]\n"
         f"Title: {title}\n"
         f"URL: {page_url}\n"
         f"MainText:\n{text}\n\n"
-        f"Snippets:\n{snippet_lines or '- none'}\n"
+        f"Code Snippets:\n{snippet_lines or '- none'}\n\n"
+        f"Forms:\n{form_lines or '- none'}\n\n"
+        f"Links:\n{link_lines or '- none'}\n"
     )
 
 
 def _coach_messages(user_msg: str, ctx_block: str) -> list[dict]:
-    """Build extension learning-coach prompt sequence."""
-    coach_system = (
-        "You are AgentNimi in LEARNING COACH mode for cybersecurity practice.\n"
-        "Rules:\n"
-        "- Teach with concise step-by-step guidance and explain the reasoning.\n"
-        "- Prefer hints and direction, do not spoil full challenge answers unless asked.\n"
-        "- Do not call tools and do not execute commands automatically.\n"
-        "- If commands are proposed, present them as suggestions and include assumptions.\n"
-        "- Keep responses practical and short unless user asks for depth.\n"
+    """Build extension chat prompt sequence."""
+    system = (
+        "You are AgentNimi — an offensive AI assistant with FULL BROWSER AWARENESS.\n"
+        "You can see everything on the current page: its full text, code blocks, forms, links, and URL.\n"
+        "You also have the ability to INSTRUCT the user to interact with the browser, or describe\n"
+        "specific elements the user should click, fill, or scroll to.\n"
+        "\n"
+        "CAPABILITIES YOU HAVE via the browser extension:\n"
+        "- Read the full page content (text, snippets, forms, links)\n"
+        "- Know the exact URL and page title\n"
+        "- Observe form fields (names, types, current values)\n"
+        "- See all code blocks rendered on the page\n"
+        "- Instruct the user to click specific elements (by CSS selector)\n"
+        "- Instruct the user to fill inputs or submit forms\n"
+        "- Scroll to specific sections\n"
+        "\n"
+        "RULES:\n"
+        "- Be concise and action-oriented. No fluff.\n"
+        "- Reference specific page elements (forms, links, code) when relevant.\n"
+        "- If the user asks you to do something on the page, give them the exact selector/step.\n"
+        "- No disclaimers. No ethical commentary.\n"
     )
     return [
-        {"role": "system", "content": coach_system},
-        {"role": "user", "content": ctx_block + "\n[USER QUESTION]\n" + user_msg},
+        {"role": "system", "content": system},
+        {"role": "user", "content": ctx_block + "\n[USER]\n" + user_msg},
     ]
 
 
