@@ -67,10 +67,15 @@ function payload() {
 }
 
 function syncContext() {
-  chrome.runtime.sendMessage(
-    { type: "page_context", payload: payload() },
-    () => void chrome.runtime.lastError
-  );
+  if (!chrome.runtime?.id) return; // extension context invalidated after reload
+  try {
+    chrome.runtime.sendMessage(
+      { type: "page_context", payload: payload() },
+      () => void chrome.runtime.lastError
+    );
+  } catch (_) {
+    // swallow "Extension context invalidated" errors silently
+  }
 }
 
 // ─── Browser Actions (agent can trigger these) ────────────────────────────────
