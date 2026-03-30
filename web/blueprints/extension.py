@@ -2,14 +2,30 @@
 import datetime
 import json
 import queue
+import re
 import threading
 import uuid
+from urllib.parse import urlparse
 from flask import Blueprint, jsonify, request, Response, stream_with_context
 
 from core.audit import audit_event
 from web.utils import state
 
 extension_bp = Blueprint("extension", __name__, url_prefix="/api/extension")
+
+_PAGE_REF_RE = re.compile(
+    r"\b(this|that|current)\s+(site|page|website|domain|url)\b"
+    r"|\bhere\b"
+    r"|\bthe one (?:we are|we're) viewing\b"
+    r"|\bthe (?:site|page|website) (?:we are|we're) viewing\b",
+    re.IGNORECASE,
+)
+_CONCRETE_TARGET_RE = re.compile(
+    r"https?://\S+|\b(?:\d{1,3}\.){3}\d{1,3}(?:/\d{1,2})?\b|\b[a-z0-9-]+(?:\.[a-z0-9-]+)+\b",
+    re.IGNORECASE,
+)
+_TARGET_REQUEST_RE = re.compile(r"\b(target|domain|url|ip|host|site)\b", re.IGNORECASE)
+_STREAM_WORD_RE = re.compile(r"\S+\s*|\s+")
 
 
 def _cors(resp):
@@ -53,6 +69,119 @@ def _context_block(ctx: dict, max_chars: int = 8000) -> str:
         f"Forms:\n{form_lines or '- none'}\n\n"
         f"Links:\n{link_lines or '- none'}\n"
     )
+
+
+def _contains_page_reference(text: str) -> bool:
+    return bool(_PAGE_REF_RE.search(text or ""))
+
+
+def _has_concrete_target(text: str) -> bool:
+    return bool(_CONCRETE_TARGET_RE.search(text or ""))
+
+
+def _target_from_context(ctx: dict) -> str:
+    page_url = str((ctx or {}).get("url", "")).strip()
+    if not page_url:
+        return ""
+    parsed = urlparse(page_url)
+    if parsed.hostname:
+        return parsed.hostname
+    if parsed.netloc:
+        return parsed.netloc
+    if "://" in page_url:
+        return page_url.split("://", 1)[1].split("/", 1)[0]
+    return page_url.split("/", 1)[0]
+
+
+def _rewrite_page_reference(user_msg: str, target: str) -> str:
+    return _PAGE_REF_RE.sub(target, user_msg or "")
+
+
+def _last_assistant_message(messages: list[dict]) -> str:
+    for msg in reversed(messages or []):
+        if str(msg.get("role", "")) == "assistant":
+            return str(msg.get("content", ""))
+    return ""
+
+
+def _assistant_waiting_for_target(messages: list[dict]) -> bool:
+    last_reply = _last_assistant_message(messages).strip()
+    if not last_reply:
+        return False
+    asks_question = "?" in last_reply
+    asks_target = bool(_TARGET_REQUEST_RE.search(last_reply))
+    return asks_question and asks_target
+
+
+def _resolve_target_reference(user_msg: str, resolved_target: str, awaiting_target_reply: bool):
+    """
+    Resolve deictic target references ("this site", "the one we're viewing")
+    without relying on action keyword lists.
+    """
+    normalized = str(user_msg or "")
+    notes = []
+
+    has_page_reference = _contains_page_reference(normalized)
+    has_explicit_target = _has_concrete_target(normalized)
+
+    if has_page_reference and not resolved_target:
+        return "", "", (
+            "I could not resolve the active page target. "
+            "Refresh the page once and try again, or provide an explicit URL/domain/IP."
+        )
+
+    if has_page_reference and resolved_target:
+        normalized = _rewrite_page_reference(normalized, resolved_target)
+        notes.append(
+            "[EXTENSION TARGET RESOLUTION]\n"
+            f"Resolved page reference to active tab target: {resolved_target}\n"
+            "Do not use placeholder phrases as tool targets.\n"
+        )
+    elif awaiting_target_reply and not has_explicit_target and resolved_target:
+        # Follow-up answers like "the one we are viewing" / "that one" should map
+        # to the active tab target when the previous assistant asked for a target.
+        normalized = (
+            f"{normalized}\n\n"
+            f"[Resolved follow-up target from active browser tab: {resolved_target}]"
+        )
+
+    return normalized, "".join(notes), ""
+
+
+def _iter_stream_units(text: str):
+    """Yield text in small word-like units for smooth streaming in side panel."""
+    raw = str(text or "")
+    if not raw:
+        return
+    for unit in _STREAM_WORD_RE.findall(raw):
+        if unit:
+            yield unit
+
+
+def _enqueue_stream_event(q, event_data):
+    """Queue extension stream events, splitting text chunks word-by-word."""
+    if isinstance(event_data, dict):
+        if "event" in event_data and "type" not in event_data:
+            event_data = {**event_data, "type": event_data["event"]}
+
+        ev_type = str(event_data.get("type") or "")
+        if ev_type in {"chunk", "text_chunk"}:
+            original_text = event_data.get("content")
+            if original_text is None:
+                original_text = event_data.get("text", "")
+            for unit in _iter_stream_units(original_text):
+                payload = dict(event_data)
+                payload["content"] = unit
+                if "text" in payload and payload.get("text") == original_text:
+                    payload["text"] = unit
+                q.put(payload)
+            return
+
+        q.put(event_data)
+        return
+
+    for unit in _iter_stream_units(event_data):
+        q.put({"type": "chunk", "content": unit})
 
 
 @extension_bp.route("/health", methods=["GET", "OPTIONS"])
@@ -114,38 +243,75 @@ def extension_chat():
 
     tab_key = str(data.get("tab_key") or data.get("session_id") or "default")
     session_id = str(data.get("session_id") or uuid.uuid4())
+    requested_conv_id = str(data.get("conversation_id") or "").strip()
     ext_ctx = state.get_extension_context(tab_key)
+    resolved_target = _target_from_context(ext_ctx)
 
-    ext_conf = (state.config or {}).get("extension", {})
-    max_ctx = int(ext_conf.get("max_context_chars", 8000) or 8000)
-
-    # Prepend page context so the agent knows what page the user is on
-    ctx_block = _context_block(ext_ctx, max_chars=max_ctx) if ext_ctx else ""
-    full_msg = (ctx_block + "\n" + user_msg).strip() if ctx_block else user_msg
-
-    # ── Create a real conversation visible in the main web UI ──────────────────
+    # ── Resolve and/or reuse conversation for this tab ────────────────────────
     from web.services import conversation_service
     from config import SYSTEM_PROMPT
     from core.session_memory import start_engagement, add_finding
 
-    conv_id = str(uuid.uuid4())
-    page_title = ext_ctx.get("title", "") if ext_ctx else ""
-    raw_title = f"[Browser] {page_title}: {user_msg}" if page_title else f"[Browser] {user_msg}"
-    conv_title = conversation_service.generate_title(raw_title)
-    conv_data = {
-        "id": conv_id,
-        "title": conv_title,
-        "created_at": datetime.datetime.now().isoformat(),
-        "updated_at": datetime.datetime.now().isoformat(),
-        "messages": [],
-        "source": "extension",
-    }
-    conversation_service.save_conversation(conv_id, conv_data)
+    conv_id = requested_conv_id or state.get_extension_conversation(tab_key) or str(uuid.uuid4())
+    existing_conv = conversation_service.load_conversation(conv_id)
+    awaiting_target_reply = _assistant_waiting_for_target(
+        (existing_conv or {}).get("messages", [])
+    )
 
-    # Reset agent to a fresh conversation context
+    ext_conf = (state.config or {}).get("extension", {})
+    max_ctx = int(ext_conf.get("max_context_chars", 8000) or 8000)
+
+    normalized_user_msg, disambiguation_note, resolution_error = _resolve_target_reference(
+        user_msg=user_msg,
+        resolved_target=resolved_target,
+        awaiting_target_reply=awaiting_target_reply,
+    )
+    if resolution_error:
+        return _cors(jsonify({"error": resolution_error})), 400
+
+    # Prepend page context so the agent knows what page the user is on.
+    ctx_block = _context_block(ext_ctx, max_chars=max_ctx) if ext_ctx else ""
+    prompt_parts = [
+        ctx_block,
+        (
+            "[EXTENSION GUARDRAIL]\n"
+            "Use ACTIVE_PAGE_URL/ACTIVE_PAGE_DOMAIN for page-referenced requests.\n"
+            "Do not pass placeholders like 'this site' or 'this target' to tools.\n"
+        ) if ctx_block else "",
+        disambiguation_note,
+        normalized_user_msg,
+    ]
+    full_msg = "\n".join(part for part in prompt_parts if part).strip()
+
+    # ── Create a real conversation visible in the main web UI ──────────────────
+    page_title = ext_ctx.get("title", "") if ext_ctx else ""
+    if existing_conv:
+        conv_data = existing_conv
+        conv_data["source"] = conv_data.get("source", "extension")
+    else:
+        raw_title = f"[Browser] {page_title}: {user_msg}" if page_title else f"[Browser] {user_msg}"
+        conv_title = conversation_service.generate_title(raw_title)
+        conv_data = {
+            "id": conv_id,
+            "title": conv_title,
+            "created_at": datetime.datetime.now().isoformat(),
+            "updated_at": datetime.datetime.now().isoformat(),
+            "messages": [],
+            "source": "extension",
+        }
+        conversation_service.save_conversation(conv_id, conv_data)
+
+    state.set_extension_conversation(tab_key, conv_id)
+
+    # Rebuild agent context from the selected conversation.
     state.agent.messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+    for msg in conv_data.get("messages", []):
+        role = str(msg.get("role", "")).strip()
+        content = str(msg.get("content", ""))
+        if role in {"user", "assistant"} and content:
+            state.agent.messages.append({"role": role, "content": content})
     state.set_current_conv_id(conv_id)
-    start_engagement(conv_id, conv_title)
+    start_engagement(conv_id, conv_data.get("title", ""))
 
     # Persist the user message (store the clean version, not the context-prefixed one)
     conv_data["messages"].append({
@@ -158,21 +324,15 @@ def extension_chat():
     q = state.get_session(session_id)
 
     def stream_callback(event_data):
-        if isinstance(event_data, dict):
-            if "event" in event_data and "type" not in event_data:
-                event_data = {**event_data, "type": event_data["event"]}
-            q.put(event_data)
-        else:
-            q.put({"type": "chunk", "content": str(event_data)})
+        _enqueue_stream_event(q, event_data)
 
     def run_agent():
         try:
             # Full agent loop — nmap, shell, subdomains, all tools available
             response = state.agent.chat(full_msg, stream_callback=stream_callback)
 
-            q.put({"type": "done", "content": response, "conversation_id": conv_id})
-
-            # Persist assistant response
+            # Persist assistant response BEFORE sending done so the web UI
+            # always sees the full conversation when it loads via the extension link.
             conv_data["messages"].append({
                 "role": "assistant",
                 "content": response,
@@ -181,6 +341,7 @@ def extension_chat():
             conversation_service.save_conversation(conv_id, conv_data)
             add_finding(conv_id, response[:3000])
             audit_event("extension_chat_complete", {"conversation_id": conv_id})
+            q.put({"type": "done", "content": response, "conversation_id": conv_id})
         except Exception as e:
             q.put({"type": "error", "message": str(e)})
         finally:

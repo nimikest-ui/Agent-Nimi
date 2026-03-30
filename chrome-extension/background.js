@@ -141,19 +141,46 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   if (msg.type === "companion_stream_chat") {
     const tabId = msg.tabId;
     const text = String(msg.message || "").trim();
+    const conversationId = String(msg.conversationId || "").trim();
     if (!text) {
       sendResponse({ ok: false, error: "Empty message" });
       return false;
     }
     getApiBase()
       .then(async (apiBase) => {
-        const res = await fetch(`${apiBase}/api/extension/chat`, {
+        // Build page-context block from cached tab context and prepend to message.
+        const ctxInfo = lastContextByTab.get(String(tabId || ""));
+        let fullMessage = text;
+        if (ctxInfo && ctxInfo.payload && (Date.now() - ctxInfo.ts) < CONTEXT_TTL_MS) {
+          const c = ctxInfo.payload;
+          const domain = c.url ? c.url.replace(/https?:\/\//, "").split("/")[0] : "";
+          const snippets = (c.snippets || []).slice(0, 6).map(s => `- ${String(s).slice(0, 200)}`).join("\n");
+          const links = (c.links || []).slice(0, 10).map(l => `- [${l.text || ""}](${l.href || ""})`).join("\n");
+          const ctxBlock = [
+            "[PAGE CONTEXT]",
+            `ACTIVE_PAGE_URL: ${c.url || ""}`,
+            `ACTIVE_PAGE_DOMAIN: ${domain}`,
+            `Title: ${c.title || ""}`,
+            "NOTE: When the user says 'this site', 'this page', or 'here', they mean ACTIVE_PAGE_DOMAIN above.",
+            "",
+            `MainText:\n${String(c.text || "").slice(0, 6000)}`,
+            snippets ? `\nCode Snippets:\n${snippets}` : "",
+            links ? `\nLinks:\n${links}` : "",
+          ].filter(Boolean).join("\n");
+          fullMessage = `${ctxBlock}\n\n${text}`;
+        }
+
+        // Send directly to /api/chat — same pipeline as the web UI.
+        // The web UI will show the full live conversation automatically.
+        // display_message is the original clean text; message has the page context prepended.
+        const res = await fetch(`${apiBase}/api/chat`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
-            tab_key: String(tabId || "default"),
-            session_id: `ext-${Date.now()}`,
-            message: text
+            message: fullMessage,
+            display_message: text,
+            conversation_id: conversationId || undefined,
+            mode: "agent"
           })
         });
         if (!res.ok || !res.body) {
@@ -165,12 +192,8 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         const reader = res.body.getReader();
         const decoder = new TextDecoder();
         let buf = "";
-        while (true) {
-          const { done, value } = await reader.read();
-          if (done) break;
-          buf += decoder.decode(value, { stream: true });
-          const lines = buf.split("\n");
-          buf = lines.pop() || "";
+        const emitDataLines = (text) => {
+          const lines = String(text || "").split("\n");
           for (const line of lines) {
             if (!line.startsWith("data: ")) continue;
             try {
@@ -180,7 +203,18 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
               // ignore malformed line
             }
           }
+        };
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          buf += decoder.decode(value, { stream: true });
+          const lines = buf.split("\n");
+          buf = lines.pop() || "";
+          emitDataLines(lines.join("\n"));
         }
+        // Flush decoder + parse any final buffered event line at EOF.
+        buf += decoder.decode();
+        if (buf.trim()) emitDataLines(buf);
         chrome.runtime.sendMessage({ type: "companion_stream_end" });
         sendResponse({ ok: true });
       })

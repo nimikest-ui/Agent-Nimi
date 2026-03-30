@@ -373,15 +373,25 @@ class AgentNimi:
         if not any(word in text for word in action_words):
             return False
 
-        # Placeholder phrasing without concrete asset.
-        placeholder_phrases = {"scan target", "target", "the target", "that target", "this target"}
-        if any(phrase in text for phrase in placeholder_phrases):
-            has_ip = bool(re.search(r"\b(?:\d{1,3}\.){3}\d{1,3}\b", text))
-            has_cidr = bool(re.search(r"\b(?:\d{1,3}\.){3}\d{1,3}/\d{1,2}\b", text))
-            has_url = bool(re.search(r"https?://", text))
-            has_domain = bool(re.search(r"\b[a-z0-9-]+(?:\.[a-z0-9-]+)+\b", text))
-            return not (has_ip or has_cidr or has_url or has_domain)
-        return False
+        has_ip = bool(re.search(r"\b(?:\d{1,3}\.){3}\d{1,3}\b", text))
+        has_cidr = bool(re.search(r"\b(?:\d{1,3}\.){3}\d{1,3}/\d{1,2}\b", text))
+        has_url = bool(re.search(r"https?://", text))
+        has_domain = bool(re.search(r"\b[a-z0-9-]+(?:\.[a-z0-9-]+)+\b", text))
+        has_explicit_target = has_ip or has_cidr or has_url or has_domain
+        if has_explicit_target:
+            return False
+
+        # Pattern-based deictic target detection (avoids brittle phrase lists).
+        deictic = bool(re.search(r"\b(this|that|current|same|here|there)\b", text))
+        asset_noun = bool(re.search(r"\b(target|site|page|website|domain|url|host)\b", text))
+        viewing_phrase = bool(
+            re.search(
+                r"\bthe one (?:we are|we're) viewing\b"
+                r"|\bthe (?:site|page|website) (?:we are|we're) viewing\b",
+                text,
+            )
+        )
+        return viewing_phrase or (deictic and asset_noun)
 
     # Words/phrases that indicate a direct single-action request —
     # no need for multiagent decomposition.

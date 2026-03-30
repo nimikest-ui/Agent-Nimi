@@ -3,6 +3,11 @@
 
 // ── State ──────────────────────────────────────────────────────────────────
 let currentConvId = null;
+
+// ── Browser Panel State ───────────────────────────────────────────────────────
+let browserSessionId = null;
+let browserSSE = null;          // EventSource
+let browserDragging = false;
 let isStreaming = false;
 let abortController = null;
 let currentAssistantDiv = null;
@@ -81,6 +86,40 @@ document.addEventListener('DOMContentLoaded', () => {
     if (e.target.id === 'tool-modal') closeToolModal();
   });
 
+  // Browser panel
+  document.getElementById('btn-open-browser')?.addEventListener('click', onOpenBrowserBtnClick);
+  document.getElementById('browser-modal-close')?.addEventListener('click', closeBrowserModal);
+  document.getElementById('browser-modal-cancel')?.addEventListener('click', closeBrowserModal);
+  document.getElementById('browser-modal-open')?.addEventListener('click', launchBrowser);
+  document.getElementById('browser-open-modal')?.addEventListener('click', e => {
+    if (e.target.id === 'browser-open-modal') closeBrowserModal();
+  });
+  document.getElementById('browser-close-panel')?.addEventListener('click', closeBrowserPanel);
+  document.getElementById('browser-go')?.addEventListener('click', browserGo);
+  document.getElementById('browser-url-bar')?.addEventListener('keydown', e => {
+    if (e.key === 'Enter') { e.preventDefault(); browserGo(); }
+  });
+  document.getElementById('browser-back')?.addEventListener('click', () => browserHistoryStep(-1));
+  document.getElementById('browser-fwd')?.addEventListener('click', () => browserHistoryStep(1));
+  document.getElementById('browser-reload')?.addEventListener('click', () => {
+    if (browserSessionId) fetch(`/api/browser/${browserSessionId}/action`, {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({type:'key', key:'F5'})
+    });
+  });
+  // Mouse/keyboard forwarding on the browser screenshot image
+  const bvp = document.getElementById('browser-viewport');
+  if (bvp) {
+    bvp.addEventListener('click',      browserForwardMouse.bind(null, 'click'));
+    bvp.addEventListener('dblclick',   browserForwardMouse.bind(null, 'dblclick'));
+    bvp.addEventListener('mousemove',  browserForwardMouse.bind(null, 'mousemove'));
+    bvp.addEventListener('mousedown',  browserForwardMouse.bind(null, 'mousedown'));
+    bvp.addEventListener('mouseup',    browserForwardMouse.bind(null, 'mouseup'));
+    bvp.addEventListener('wheel',      browserForwardWheel, {passive:true});
+    bvp.addEventListener('keydown',    browserForwardKey, true);
+    bvp.setAttribute('tabindex', '0');
+  }
+
   // Power
   document.getElementById('btn-shutdown')?.addEventListener('click', shutdownServer);
   document.getElementById('btn-restart')?.addEventListener('click', restartServer);
@@ -102,7 +141,17 @@ document.addEventListener('DOMContentLoaded', () => {
 
   // Init
   loadStatus();
-  loadConversations();
+  loadConversations().then(() => {
+    // Auto-load a conversation specified via ?conv=<id> in the URL.
+    // This is used by the Chrome extension's "View full session" link.
+    const convParam = new URLSearchParams(window.location.search).get('conv');
+    if (convParam) {
+      switchConversation(convParam);
+      // Clean up the URL so refreshing doesn't re-trigger the load.
+      const cleanUrl = window.location.pathname;
+      window.history.replaceState({}, '', cleanUrl);
+    }
+  });
   loadRouterStatus();
   loadTools();
 });
@@ -417,18 +466,24 @@ async function sendMessage() {
     const reader = resp.body.getReader();
     const decoder = new TextDecoder();
     let buf = '';
+    const emitDataLines = (text) => {
+      const lines = String(text || '').split('\n');
+      for (const line of lines) {
+        if (!line.startsWith('data: ')) continue;
+        try { handleEvent(JSON.parse(line.slice(6))); } catch(e) {}
+      }
+    };
     while (true) {
       const {done, value} = await reader.read();
       if (done) break;
       buf += decoder.decode(value, {stream:true});
       const lines = buf.split('\n');
-      buf = lines.pop();
-      for (const line of lines) {
-        if (line.startsWith('data: ')) {
-          try { handleEvent(JSON.parse(line.slice(6))); } catch(e) {}
-        }
-      }
+      buf = lines.pop() || '';
+      emitDataLines(lines.join('\n'));
     }
+    // Flush decoder + parse any final buffered event line at EOF.
+    buf += decoder.decode();
+    if (buf.trim()) emitDataLines(buf);
   } catch(e) {
     if (e.name !== 'AbortError') appendTextChunk('[Connection error]');
   } finally {
@@ -1579,4 +1634,232 @@ function renderSession() {
     </div>`;
   });
   panel.innerHTML = html || '<div class="mem-empty">No session data</div>';
+}
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// Browser Panel
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+function onOpenBrowserBtnClick() {
+  if (browserSessionId) {
+    // Toggle panel visibility
+    const panel = document.getElementById('browser-panel');
+    if (panel.classList.contains('open')) {
+      closeBrowserPanel();
+    } else {
+      panel.classList.add('open');
+      document.getElementById('main')?.classList.add('browser-open');
+      document.getElementById('btn-open-browser')?.classList.add('active');
+    }
+  } else {
+    openBrowserModal();
+  }
+}
+
+function openBrowserModal() {
+  const modal = document.getElementById('browser-open-modal');
+  if (modal) modal.style.display = 'flex';
+  setTimeout(() => document.getElementById('browser-open-url')?.focus(), 50);
+}
+
+function closeBrowserModal() {
+  const modal = document.getElementById('browser-open-modal');
+  if (modal) modal.style.display = 'none';
+}
+
+async function launchBrowser() {
+  const urlInput = document.getElementById('browser-open-url');
+  const url = (urlInput?.value || 'https://www.google.com').trim();
+  closeBrowserModal();
+
+  // Show panel in loading state
+  const panel = document.getElementById('browser-panel');
+  const screen = document.getElementById('browser-screen');
+  const loading = document.getElementById('browser-loading');
+  const loadingText = document.getElementById('browser-loading-text');
+
+  screen.src = '';
+  loading.classList.remove('hidden');
+  if (loadingText) loadingText.textContent = 'Opening browser…';
+  panel.classList.add('open');
+  document.getElementById('main')?.classList.add('browser-open');
+  document.getElementById('btn-open-browser')?.classList.add('active');
+
+  try {
+    const res = await fetch('/api/browser/open', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ url }),
+    });
+    const data = await res.json();
+    if (!data.success) throw new Error(data.error || 'Failed to open browser');
+
+    browserSessionId = data.session_id;
+    document.getElementById('browser-session-id').textContent = data.session_id;
+    document.getElementById('browser-url-bar').value = url;
+    document.getElementById('browser-status-url').textContent = url;
+
+    startBrowserStream();
+  } catch (err) {
+    if (loadingText) loadingText.textContent = '⚠ ' + err.message;
+    console.error('Browser launch error:', err);
+  }
+}
+
+function startBrowserStream() {
+  if (!browserSessionId) return;
+  if (browserSSE) { browserSSE.close(); browserSSE = null; }
+
+  const screen = document.getElementById('browser-screen');
+  const loading = document.getElementById('browser-loading');
+  const urlBar = document.getElementById('browser-url-bar');
+  const statusUrl = document.getElementById('browser-status-url');
+
+  browserSSE = new EventSource(`/api/browser/${browserSessionId}/stream`);
+
+  browserSSE.onmessage = (e) => {
+    try {
+      const payload = JSON.parse(e.data);
+      if (payload.frame) {
+        screen.src = 'data:image/png;base64,' + payload.frame;
+        loading.classList.add('hidden');
+      }
+      if (payload.url) {
+        urlBar.value = payload.url;
+        statusUrl.textContent = payload.url;
+        if (payload.title) document.getElementById('browser-session-id').title = payload.title;
+      }
+    } catch (_) {}
+  };
+
+  browserSSE.addEventListener('closed', () => {
+    closeBrowserPanel();
+  });
+
+  browserSSE.onerror = () => {
+    // Silently retry; EventSource auto-reconnects
+  };
+}
+
+function closeBrowserPanel() {
+  // Stop SSE
+  if (browserSSE) { browserSSE.close(); browserSSE = null; }
+
+  // Close session on server
+  if (browserSessionId) {
+    fetch(`/api/browser/${browserSessionId}/close`, { method: 'POST' }).catch(() => {});
+    browserSessionId = null;
+  }
+
+  // Hide panel
+  const panel = document.getElementById('browser-panel');
+  panel.classList.remove('open');
+  document.getElementById('main')?.classList.remove('browser-open');
+  document.getElementById('btn-open-browser')?.classList.remove('active');
+
+  // Reset UI
+  document.getElementById('browser-screen').src = '';
+  document.getElementById('browser-url-bar').value = '';
+  document.getElementById('browser-status-url').textContent = '—';
+  document.getElementById('browser-session-id').textContent = '';
+  const loading = document.getElementById('browser-loading');
+  loading.classList.remove('hidden');
+  document.getElementById('browser-loading-text').textContent = 'Opening browser…';
+}
+
+function browserGo() {
+  if (!browserSessionId) return;
+  const url = document.getElementById('browser-url-bar').value.trim();
+  if (!url) return;
+  fetch(`/api/browser/${browserSessionId}/navigate`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ url }),
+  }).catch(() => {});
+  document.getElementById('browser-status-url').textContent = url;
+}
+
+function browserHistoryStep(delta) {
+  if (!browserSessionId) return;
+  const js = delta < 0 ? 'history.back()' : 'history.forward()';
+  fetch(`/api/browser/${browserSessionId}/action`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ type: 'key', key: delta < 0 ? 'Alt+ArrowLeft' : 'Alt+ArrowRight' }),
+  }).catch(() => {});
+}
+
+/** Convert viewport-relative coordinates to browser page coordinates (1280×800). */
+function browserScaleCoords(e) {
+  const screen = document.getElementById('browser-screen');
+  const rect = screen.getBoundingClientRect();
+  // Natural page size (Playwright default)
+  const PAGE_W = 1280, PAGE_H = 800;
+  const scaleX = PAGE_W / rect.width;
+  const scaleY = PAGE_H / rect.height;
+  return {
+    x: Math.round((e.clientX - rect.left) * scaleX),
+    y: Math.round((e.clientY - rect.top) * scaleY),
+  };
+}
+
+function browserForwardMouse(type, e) {
+  if (!browserSessionId) return;
+  // Only forward when clicking ON the screenshot
+  const screen = document.getElementById('browser-screen');
+  if (!screen.src || screen.src === window.location.href) return; // no frame yet
+  e.preventDefault();
+  const { x, y } = browserScaleCoords(e);
+  const body = { type, x, y };
+  if (e.button === 2) body.button = 'right';
+  fetch(`/api/browser/${browserSessionId}/action`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  }).catch(() => {});
+}
+
+function browserForwardWheel(e) {
+  if (!browserSessionId) return;
+  const { x, y } = browserScaleCoords(e);
+  fetch(`/api/browser/${browserSessionId}/action`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ type: 'scroll', x, y, deltaX: e.deltaX, deltaY: e.deltaY }),
+  }).catch(() => {});
+}
+
+// Map browser KeyboardEvent.key to Playwright key names
+const _KEY_MAP = {
+  ' ': 'Space', 'Backspace': 'Backspace', 'Delete': 'Delete', 'Enter': 'Enter',
+  'Tab': 'Tab', 'Escape': 'Escape', 'ArrowUp': 'ArrowUp', 'ArrowDown': 'ArrowDown',
+  'ArrowLeft': 'ArrowLeft', 'ArrowRight': 'ArrowRight',
+  'Home': 'Home', 'End': 'End', 'PageUp': 'PageUp', 'PageDown': 'PageDown',
+  'F1':'F1','F2':'F2','F3':'F3','F4':'F4','F5':'F5','F6':'F6',
+  'F7':'F7','F8':'F8','F9':'F9','F10':'F10','F11':'F11','F12':'F12',
+};
+
+function browserForwardKey(e) {
+  if (!browserSessionId) return;
+  // Don't steal browser keyboard shortcuts
+  if (e.metaKey || (e.ctrlKey && ['c','v','x','z','a','r','t','w','n'].includes(e.key.toLowerCase()))) return;
+  const bvp = document.getElementById('browser-viewport');
+  if (document.activeElement !== bvp) return;
+
+  const specialKey = _KEY_MAP[e.key];
+  if (specialKey) {
+    e.preventDefault();
+    fetch(`/api/browser/${browserSessionId}/action`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ type: 'key', key: specialKey }),
+    }).catch(() => {});
+  } else if (e.key.length === 1) {
+    // Printable character
+    fetch(`/api/browser/${browserSessionId}/action`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ type: 'type', text: e.key }),
+    }).catch(() => {});
+  }
 }

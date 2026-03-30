@@ -8,6 +8,17 @@ let activeTabId = null;
 let currentAssistantEl = null;
 let streaming = false;
 let pendingConvId = null;
+let currentConvId = null;
+const convIdByTab = new Map();
+let streamedAnyText = false;
+
+function appendStreamText(text) {
+  if (!text) return;
+  if (!currentAssistantEl) currentAssistantEl = appendMessage("assistant", "");
+  currentAssistantEl.textContent += String(text);
+  streamedAnyText = true;
+  messagesEl.scrollTop = messagesEl.scrollHeight;
+}
 
 function appendMessage(role, text) {
   const el = document.createElement("div");
@@ -30,7 +41,11 @@ async function getActiveTab() {
 async function refreshContext() {
   const tab = await getActiveTab();
   if (!tab?.id) return;
+  const prevTabId = activeTabId;
   activeTabId = tab.id;
+  if (prevTabId !== activeTabId) {
+    currentConvId = convIdByTab.get(String(activeTabId)) || null;
+  }
   chrome.runtime.sendMessage({ type: "get_last_context", tabId: tab.id }, (resp) => {
     if (!resp?.ok || !resp.context) {
       contextMetaEl.textContent = "No context synced yet. Navigate to any page.";
@@ -46,15 +61,27 @@ function onStreamEvent(ev) {
   const type = ev?.type || "";
 
   if (type === "conversation_id") {
-    // Store the conversation ID — we'll show the link when done
     pendingConvId = ev.conversation_id;
+    currentConvId = ev.conversation_id || currentConvId;
+    if (activeTabId != null && currentConvId) {
+      convIdByTab.set(String(activeTabId), currentConvId);
+    }
+    // Show live link immediately — user can watch full reasoning in the web UI
+    // while the agent is still running tools.
+    const existingLink = document.getElementById("conv-link");
+    if (existingLink) existingLink.remove();
+    const link = document.createElement("a");
+    link.id = "conv-link";
+    link.href = `http://127.0.0.1:1337/?conv=${pendingConvId}`;
+    link.target = "_blank";
+    link.textContent = "\u26A1 Watch live in AgentNimi \u2197";
+    link.style.cssText = "display:block;margin:6px 8px;font-size:12px;color:#86efac;text-decoration:underline;font-weight:bold;";
+    messagesEl.after(link);
     return;
   }
 
   if (type === "chunk" || type === "text_chunk") {
-    if (!currentAssistantEl) currentAssistantEl = appendMessage("assistant", "");
-    currentAssistantEl.textContent += String(ev.content || ev.text || "");
-    messagesEl.scrollTop = messagesEl.scrollHeight;
+    appendStreamText(ev.content || ev.text || "");
     return;
   }
   if (type === "error") {
@@ -63,23 +90,22 @@ function onStreamEvent(ev) {
     return;
   }
   if (type === "done") {
+    // Fallback for providers that return a final-only payload.
+    if (!streamedAnyText && ev.content) {
+      appendStreamText(ev.content);
+    }
     streaming = false;
     sendBtn.disabled = false;
     updateStatus("connected");
     currentAssistantEl = null;
-    // Now show the link — agent is fully done, results are saved
-    if (pendingConvId) {
-      const existing = document.getElementById("conv-link");
-      if (existing) existing.remove();
-      const link = document.createElement("a");
-      link.id = "conv-link";
-      link.href = `http://127.0.0.1:1337/?conv=${pendingConvId}`;
-      link.target = "_blank";
-      link.textContent = "\u2197 View full session in AgentNimi";
-      link.style.cssText = "display:block;margin:6px 8px;font-size:12px;color:#7dd3fc;text-decoration:underline;font-weight:bold;";
-      messagesEl.after(link);
-      pendingConvId = null;
+    streamedAnyText = false;
+    // Agent is done — turn the live link into a static "view session" link.
+    const liveLink = document.getElementById("conv-link");
+    if (liveLink) {
+      liveLink.textContent = "\u2197 View full session in AgentNimi";
+      liveLink.style.color = "#7dd3fc";
     }
+    pendingConvId = null;
     return;
   }
 }
@@ -92,6 +118,7 @@ chrome.runtime.onMessage.addListener((msg) => {
     sendBtn.disabled = false;
     updateStatus("connected");
     currentAssistantEl = null;
+    streamedAnyText = false;
   }
 });
 
@@ -106,12 +133,18 @@ async function sendMessage() {
   if (oldLink) oldLink.remove();
   pendingConvId = null;
   currentAssistantEl = appendMessage("assistant", "");
+  streamedAnyText = false;
   streaming = true;
   sendBtn.disabled = true;
   updateStatus("streaming...");
 
   chrome.runtime.sendMessage(
-    { type: "companion_stream_chat", tabId: activeTabId, message: text },
+    {
+      type: "companion_stream_chat",
+      tabId: activeTabId,
+      message: text,
+      conversationId: currentConvId || undefined
+    },
     (resp) => {
       if (!resp?.ok) {
         currentAssistantEl.textContent = `[error] ${resp?.error || "failed to send"}`;

@@ -1,5 +1,6 @@
 """Chat and streaming routes."""
 import json
+import re
 import uuid
 import queue
 import threading
@@ -13,6 +14,43 @@ from web.services import conversation_service
 from web.utils import state
 
 chat_bp = Blueprint('chat', __name__, url_prefix='/api')
+_STREAM_WORD_RE = re.compile(r"\S+\s*|\s+")
+
+
+def _iter_stream_units(text: str):
+    """Yield text in small word-like units for smoother live rendering."""
+    raw = str(text or "")
+    if not raw:
+        return
+    for unit in _STREAM_WORD_RE.findall(raw):
+        if unit:
+            yield unit
+
+
+def _enqueue_stream_event(q, event_data):
+    """Queue stream events, splitting text chunks into word-level pieces."""
+    if isinstance(event_data, dict):
+        if "event" in event_data and "type" not in event_data:
+            event_data = {**event_data, "type": event_data["event"]}
+
+        ev_type = str(event_data.get("type") or "")
+        if ev_type in {"chunk", "text_chunk"}:
+            original_text = event_data.get("content")
+            if original_text is None:
+                original_text = event_data.get("text", "")
+            for unit in _iter_stream_units(original_text):
+                payload = dict(event_data)
+                payload["content"] = unit
+                if "text" in payload and payload.get("text") == original_text:
+                    payload["text"] = unit
+                q.put(payload)
+            return
+
+        q.put(event_data)
+        return
+
+    for unit in _iter_stream_units(event_data):
+        q.put({"type": "chunk", "content": unit})
 
 
 @chat_bp.route('/chat', methods=['POST'])
@@ -20,6 +58,10 @@ def chat():
     """Send a message and get a streaming response via SSE."""
     data = request.get_json()
     user_msg = data.get("message", "").strip()
+    # display_message is the clean text shown in the UI / saved to history.
+    # When the extension sends an enriched message (with [PAGE CONTEXT] block),
+    # it also sends the original user text here so the UI stays clean.
+    display_msg = data.get("display_message", "").strip() or user_msg
     mode = data.get("mode", "agent")  # ask | agent | plan
     if not user_msg:
         return jsonify({"error": "Empty message"}), 400
@@ -48,7 +90,7 @@ def chat():
         conv_id = str(uuid.uuid4())
         conv_data = {
             "id": conv_id,
-            "title": conversation_service.generate_title(user_msg),
+            "title": conversation_service.generate_title(display_msg),
             "created_at": datetime.datetime.now().isoformat(),
             "updated_at": datetime.datetime.now().isoformat(),
             "messages": [],
@@ -106,27 +148,28 @@ def chat():
                 pass
 
     # ── Persist user message ──────────────────────────────────────────────────
+    # Save the clean display text, not the context-enriched agent prompt.
     conv["messages"].append({
         "role": "user",
-        "content": user_msg,
+        "content": display_msg,
         "timestamp": datetime.datetime.now().isoformat(),
     })
-    add_in_flight(conv_id, user_msg)
+    add_in_flight(conv_id, display_msg)
     conversation_service.save_conversation(conv_id, conv)
 
     # ── Stream the agent response ─────────────────────────────────────────────
     q = state.get_session(session_id)
 
     def stream_callback(event_data):
+        # Keep audit at event granularity before splitting text chunks.
         if isinstance(event_data, dict):
-            # Normalise: agent emits {"event": "..."}, frontend expects {"type": "..."}
-            if "event" in event_data and "type" not in event_data:
-                event_data = {**event_data, "type": event_data["event"]}
-            if event_data.get("type") not in {"text_chunk", "chunk"}:
-                audit_event("stream_event", event_data)
-            q.put(event_data)
-        else:
-            q.put({"type": "chunk", "content": event_data})
+            normalized_type = event_data.get("type") or event_data.get("event")
+            if normalized_type not in {"text_chunk", "chunk"}:
+                if "event" in event_data and "type" not in event_data:
+                    audit_event("stream_event", {**event_data, "type": event_data["event"]})
+                else:
+                    audit_event("stream_event", event_data)
+        _enqueue_stream_event(q, event_data)
 
     def run_agent():
         try:
@@ -137,12 +180,12 @@ def chat():
                 result = state.agent.provider.chat(msgs, stream=True)
                 if hasattr(result, "__iter__") and not isinstance(result, str):
                     for chunk in result:
-                        q.put({"type": "chunk", "content": chunk})
+                        _enqueue_stream_event(q, {"type": "chunk", "content": chunk})
                         full += chunk
                 else:
-                    q.put({"type": "stream_notice", "message": "provider returned non-streaming response"})
+                    _enqueue_stream_event(q, {"type": "stream_notice", "message": "provider returned non-streaming response"})
                     full = str(result)
-                    q.put({"type": "chunk", "content": full})
+                    _enqueue_stream_event(q, {"type": "chunk", "content": full})
                 response = full
                 active_provider = req_provider or state.config.get("default_provider", "grok")
                 active_model = req_model or state.config.get("providers", {}).get(active_provider, {}).get("model", "")
@@ -157,12 +200,11 @@ def chat():
                 )
                 response = state.agent.chat(plan_prefix + user_msg, stream_callback=stream_callback)
             else:
-                # Default: full agent loop
+                # Default: full agent loop — user_msg may include [PAGE CONTEXT] from extension
                 response = state.agent.chat(user_msg, stream_callback=stream_callback)
             
-            q.put({"type": "done", "content": response, "conversation_id": conv_id})
-            
-            # Persist assistant response without reloading the same conversation.
+            # Persist assistant response BEFORE sending done so the web UI
+            # always sees the full conversation when it loads via the link.
             conv["messages"].append({
                 "role": "assistant",
                 "content": response,
@@ -170,6 +212,7 @@ def chat():
             })
             conversation_service.save_conversation(conv_id, conv)
             add_finding(conv_id, response[:3000])
+            q.put({"type": "done", "content": response, "conversation_id": conv_id})
         except Exception as e:
             audit_event("chat_error", {"error": str(e)[:1200], "conversation_id": conv_id})
             q.put({"type": "error", "message": str(e)})
@@ -180,6 +223,9 @@ def chat():
     thread.start()
 
     def generate():
+        # Emit conversation_id immediately so the extension sidepanel can show
+        # a live link before the agent has even started processing.
+        yield f"data: {json.dumps({'type': 'conversation_id', 'conversation_id': conv_id})}\n\n"
         deadline = 600  # total max seconds to wait for completion
         waited = 0
         while waited < deadline:

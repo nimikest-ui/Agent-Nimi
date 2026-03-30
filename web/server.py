@@ -25,6 +25,7 @@ def create_app():
     from web.blueprints.monitor import monitor_bp
     from web.blueprints.system import system_bp
     from web.blueprints.extension import extension_bp
+    from web.blueprints.browser import browser_bp
     
     app.register_blueprint(chat_bp)
     app.register_blueprint(conversations_bp)
@@ -34,6 +35,7 @@ def create_app():
     app.register_blueprint(monitor_bp)
     app.register_blueprint(system_bp)
     app.register_blueprint(extension_bp)
+    app.register_blueprint(browser_bp)
     
     # Root route
     @app.route("/")

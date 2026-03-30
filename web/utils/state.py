@@ -12,6 +12,7 @@ monitor: Optional[SystemMonitor] = None
 sessions: dict[str, queue.Queue] = {}
 current_conv_id: Optional[str] = None
 extension_contexts: dict[str, dict] = {}
+extension_conversations: dict[str, str] = {}
 
 # Prevents concurrent agent calls from colliding on shared agent state
 agent_lock = threading.Lock()
@@ -72,3 +73,13 @@ def set_extension_context(tab_key: str, context: dict):
 def get_extension_context(tab_key: str) -> dict:
     """Get latest extension context by tab/session key."""
     return extension_contexts.get(tab_key, {})
+
+
+def set_extension_conversation(tab_key: str, conv_id: str):
+    """Bind a tab/session key to a conversation id for extension continuity."""
+    extension_conversations[str(tab_key)] = str(conv_id)
+
+
+def get_extension_conversation(tab_key: str) -> Optional[str]:
+    """Get conversation id bound to a tab/session key."""
+    return extension_conversations.get(str(tab_key))

@@ -1,3 +1,8 @@
+(() => {
+  // Prevent duplicate initialization if the content script is injected more than once.
+  if (globalThis.__agentNimiContentInitialized) return;
+  globalThis.__agentNimiContentInitialized = true;
+
 // ─── Context Collection ───────────────────────────────────────────────────────
 
 function pickMainText() {
@@ -66,15 +71,53 @@ function payload() {
   };
 }
 
-function syncContext() {
-  if (!chrome.runtime?.id) return; // extension context invalidated after reload
+let extensionContextAlive = true;
+let debounceTimer = null;
+let observer = null;
+
+function isRuntimeAvailable() {
   try {
-    chrome.runtime.sendMessage(
-      { type: "page_context", payload: payload() },
-      () => void chrome.runtime.lastError
-    );
+    return Boolean(chrome?.runtime?.id);
   } catch (_) {
-    // swallow "Extension context invalidated" errors silently
+    return false;
+  }
+}
+
+function stopContextSync() {
+  if (!extensionContextAlive) return;
+  extensionContextAlive = false;
+  if (debounceTimer) {
+    clearTimeout(debounceTimer);
+    debounceTimer = null;
+  }
+  try {
+    window.removeEventListener("load", onPageLifecycle);
+    window.removeEventListener("hashchange", onPageLifecycle);
+    window.removeEventListener("popstate", onPageLifecycle);
+  } catch (_) {
+    // no-op
+  }
+  try {
+    observer?.disconnect();
+  } catch (_) {
+    // no-op
+  }
+}
+
+function syncContext() {
+  if (!extensionContextAlive) return;
+  if (!isRuntimeAvailable()) {
+    stopContextSync();
+    return;
+  }
+  try {
+    const result = chrome.runtime.sendMessage({ type: "page_context", payload: payload() });
+    // MV3 may return a Promise; ignore failures but disable further sync on invalid context.
+    if (result && typeof result.then === "function") {
+      result.catch(() => stopContextSync());
+    }
+  } catch (_) {
+    stopContextSync();
   }
 }
 
@@ -109,22 +152,31 @@ function getPageInfo() {
 
 // ─── Debounced sync ───────────────────────────────────────────────────────────
 
-let debounceTimer = null;
 const debouncedSync = () => {
+  if (!extensionContextAlive) return;
   if (debounceTimer) clearTimeout(debounceTimer);
   debounceTimer = setTimeout(syncContext, 500);
 };
 
-window.addEventListener("load", debouncedSync, { once: true });
-window.addEventListener("hashchange", debouncedSync);
-window.addEventListener("popstate", debouncedSync);
+function onPageLifecycle() {
+  debouncedSync();
+}
 
-const observer = new MutationObserver(() => debouncedSync());
+window.addEventListener("load", onPageLifecycle, { once: true });
+window.addEventListener("hashchange", onPageLifecycle);
+window.addEventListener("popstate", onPageLifecycle);
+
+observer = new MutationObserver(() => debouncedSync());
 observer.observe(document.documentElement, { childList: true, subtree: true });
 
 // ─── Message Listener ─────────────────────────────────────────────────────────
 
-chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
+function handleRuntimeMessage(msg, _sender, sendResponse) {
+  if (!extensionContextAlive) return false;
+  if (!isRuntimeAvailable()) {
+    stopContextSync();
+    return false;
+  }
   if (!msg?.type) return false;
 
   if (msg.type === "collect_context") {
@@ -148,4 +200,25 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   }
 
   return false;
-});
+}
+
+try {
+  chrome.runtime.onMessage.addListener(handleRuntimeMessage);
+} catch (_) {
+  stopContextSync();
+}
+
+// Final safety net for stale content-scripts after extension reload.
+window.addEventListener("error", (ev) => {
+  const msg = String(ev?.error?.message || ev?.message || "");
+  if (msg.includes("Extension context invalidated")) {
+    try {
+      ev.preventDefault();
+    } catch (_) {
+      // no-op
+    }
+    stopContextSync();
+  }
+}, true);
+
+})();

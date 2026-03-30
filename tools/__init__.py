@@ -5,6 +5,11 @@ from . import security_tools
 from . import monitoring_tools
 from . import file_pkg_tools
 from . import memory_tools
+try:
+    from . import browser_tools
+except Exception as _bt_err:
+    import sys
+    print(f"  ⚠️ browser_tools not loaded: {_bt_err}", file=sys.stderr)
 from .custom_loader import load_all_custom_tools, create_custom_tool, delete_custom_tool, list_custom_tools
 
 # Load user-defined custom tools from disk
