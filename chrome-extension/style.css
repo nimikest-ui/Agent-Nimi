@@ -1,0 +1,85 @@
+* { box-sizing: border-box; }
+body {
+  margin: 0;
+  font-family: Inter, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  background: #0f1115;
+  color: #e7eaf1;
+  display: flex;
+  flex-direction: column;
+  height: 100vh;
+}
+.top {
+  padding: 10px 12px;
+  border-bottom: 1px solid #2b313d;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+.title { font-weight: 600; font-size: 14px; }
+.status { font-size: 11px; color: #98a2b3; }
+.context {
+  padding: 8px 12px;
+  border-bottom: 1px solid #2b313d;
+}
+.context-title {
+  font-size: 11px;
+  color: #9fb2ff;
+  margin-bottom: 3px;
+}
+.muted {
+  font-size: 11px;
+  color: #98a2b3;
+}
+.messages {
+  flex: 1;
+  overflow-y: auto;
+  padding: 10px 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.msg {
+  padding: 8px 10px;
+  border-radius: 8px;
+  white-space: pre-wrap;
+  line-height: 1.5;
+  font-size: 13px;
+}
+.msg.user {
+  align-self: flex-end;
+  background: #2f5ee7;
+  max-width: 90%;
+}
+.msg.assistant {
+  align-self: flex-start;
+  background: #1b2230;
+  border: 1px solid #2b313d;
+  max-width: 95%;
+}
+.composer {
+  padding: 10px 12px;
+  border-top: 1px solid #2b313d;
+  display: flex;
+  gap: 8px;
+}
+textarea {
+  flex: 1;
+  border: 1px solid #2b313d;
+  background: #121722;
+  color: #e7eaf1;
+  border-radius: 8px;
+  padding: 8px;
+  resize: none;
+}
+button {
+  min-width: 74px;
+  border: 0;
+  background: #4b7cff;
+  color: white;
+  border-radius: 8px;
+  cursor: pointer;
+}
+button:disabled {
+  opacity: 0.6;
+  cursor: default;
+}

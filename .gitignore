@@ -1,0 +1,9 @@
+.venv/
+__pycache__/
+*.pyc
+.vscode/
+agentred/
+agent-nimi.code-workspace
+agent-nimi.workspace.code-workspace
+subdomains.txt
+*.html

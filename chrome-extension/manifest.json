@@ -1,0 +1,37 @@
+{
+  "manifest_version": 3,
+  "name": "AgentNimi TDXArena Companion",
+  "version": "0.1.0",
+  "description": "Chrome side panel companion for learning cybersecurity with AgentNimi on TDXArena.",
+  "permissions": [
+    "sidePanel",
+    "storage",
+    "tabs"
+  ],
+  "host_permissions": [
+    "https://tdxarena.com/*",
+    "http://127.0.0.1:1337/*",
+    "http://localhost:1337/*"
+  ],
+  "background": {
+    "service_worker": "background.js",
+    "type": "module"
+  },
+  "action": {
+    "default_title": "AgentNimi Companion"
+  },
+  "side_panel": {
+    "default_path": "sidepanel.html"
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "https://tdxarena.com/*"
+      ],
+      "js": [
+        "content.js"
+      ],
+      "run_at": "document_idle"
+    }
+  ]
+}
