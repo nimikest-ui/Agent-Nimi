@@ -240,7 +240,7 @@ class AutoEvaluator:
             return None
         from providers import get_provider
         providers_conf = getattr(agent, "config", {}).get("providers", {})
-        for pname in ("copilot", "grok"):
+        for pname in ("grok", "copilot"):  # prefer cheaper grok-mini before expensive claude-sonnet
             if pname in providers_conf:
                 try:
                     return get_provider(pname, providers_conf[pname])
@@ -285,16 +285,26 @@ class AutoEvaluator:
     }
 
     def classify_task(self, prompt: str) -> str:
-        """Classify a user prompt into a task type."""
+        """Classify a user prompt into a task type.
+
+        "analysis" is a broad catch-all pattern — if any more-specific type
+        also matches, prefer that over "analysis" to avoid misclassification.
+        """
         prompt_lower = prompt.lower()
         scores = {}
         for task_type, pattern in self.TASK_PATTERNS.items():
             matches = len(re.findall(pattern, prompt_lower))
             if matches:
                 scores[task_type] = matches
-        if scores:
-            return max(scores, key=scores.get)
-        return "general"
+        if not scores:
+            return "general"
+        best = max(scores, key=scores.get)
+        # Don't let the generic "analysis" regex override a more-specific match
+        if best == "analysis":
+            specific = {k: v for k, v in scores.items() if k != "analysis"}
+            if specific:
+                return max(specific, key=specific.get)
+        return best
 
     # ─── Scoring Functions ───
 
@@ -329,7 +339,7 @@ class AutoEvaluator:
         else:
             # Gaussian-ish: score peaks at ideal, decays for shorter/longer
             ratio = (words - ideal) / max(ideal, 1)
-            length_bonus = 0.15 * math.exp(-(ratio ** 2))
+            length_bonus = 0.20 * math.exp(-(ratio ** 2))  # raised 0.15→0.20 for better score resolution
             score += length_bonus
             if words < 15:
                 score -= 0.15

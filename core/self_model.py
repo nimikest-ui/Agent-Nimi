@@ -91,8 +91,8 @@ def build_self_model(agent, config: dict) -> dict[str, Any]:
         "trust_tiers": trust_tiers,
         "inventory": {
             "providers": providers,
-            "tools": sorted(list_tools()),
-            "tool_count": len(list_tools()),
+            "tools": (_tools := sorted(list_tools())),
+            "tool_count": len(_tools),
             "tool_manifests": list_tool_manifests(),
         },
         "performance": perf,

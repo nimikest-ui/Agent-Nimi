@@ -75,6 +75,9 @@ def run_workflow(
     context = initial_input
     step_outputs: list[dict] = []
     start = time.time()
+    # Snapshot messages before workflow begins; step prompts are scoped and
+    # do not persist into the main conversation after the workflow completes.
+    _pre_workflow_messages = list(agent.messages)
 
     audit_event("workflow_start", {
         "workflow": workflow.name,
@@ -102,17 +105,23 @@ def run_workflow(
 
         prompt = step.render_prompt(context)
 
-        # Inject the prompt into agent messages
-        agent.messages.append({"role": "user", "content": prompt})
+        # Build a scoped message list: pre-workflow snapshot + step prompt.
+        # agent.messages is swapped for the duration of _agent_loop so step
+        # prompts and intermediate tool calls don't pollute future conversations.
+        _step_messages = list(_pre_workflow_messages)
+        _step_messages.append({"role": "user", "content": prompt})
 
-        # Save & apply tool whitelist
+        # Save & apply tool whitelist + scoped messages
+        _original_messages = agent.messages
         _original_tools_allowed = getattr(agent, "_workflow_tools_allowed", None)
+        agent.messages = _step_messages
         agent._workflow_tools_allowed = step.tools_allowed
 
         try:
             result = agent._agent_loop(stream_callback)
         finally:
-            # Restore
+            # Restore messages and tool whitelist
+            agent.messages = _original_messages
             agent._workflow_tools_allowed = _original_tools_allowed
 
         step_elapsed = time.time() - step_start
@@ -204,7 +213,7 @@ def _has_findings(result: str) -> bool:
 
 RECON_WORKFLOW = Workflow(
     name="recon",
-    description="Full reconnaissance pipeline: enumerate → analyze → report",
+    description="Full reconnaissance pipeline: enumerate → OSINT enrich → analyze → report",
     steps=[
         WorkflowStep(
             name="enumerate",
@@ -214,6 +223,19 @@ RECON_WORKFLOW = Workflow(
                 "Gather as much information as possible about the target."
             ),
             tools_allowed=["nmap_scan", "shell_exec", "file_read"],
+            gate=_not_empty,
+        ),
+        WorkflowStep(
+            name="osint_enrich",
+            prompt_template=(
+                "Enrich these recon results with OSINT data. For each discovered "
+                "service/version, run cve_lookup. Run whois_lookup on the target "
+                "domain/IP. Use web_search to find known issues, default creds, "
+                "or advisories. Use github_search if any custom software is detected.\n\n"
+                "{context}"
+            ),
+            tools_allowed=["web_search", "cve_lookup", "github_search", "whois_lookup",
+                           "shodan_host", "searchsploit", "shell_exec"],
             gate=_not_empty,
         ),
         WorkflowStep(
@@ -246,10 +268,12 @@ EXPLOIT_WORKFLOW = Workflow(
             name="research",
             prompt_template=(
                 "Research known vulnerabilities and exploits for the following "
-                "target/service. Check CVEs, exploit databases, and known attack "
-                "patterns:\n\n{context}"
+                "target/service. Use cve_lookup for specific CVE IDs, web_search for "
+                "advisories and PoCs, github_search for exploit code, and searchsploit "
+                "for local Exploit-DB matches:\n\n{context}"
             ),
-            tools_allowed=["searchsploit", "shell_exec", "file_read"],
+            tools_allowed=["searchsploit", "shell_exec", "file_read",
+                           "web_search", "cve_lookup", "github_search"],
             gate=_has_findings,
         ),
         WorkflowStep(
@@ -265,9 +289,10 @@ EXPLOIT_WORKFLOW = Workflow(
             name="validate",
             prompt_template=(
                 "Review and validate this exploit / attack plan for correctness, "
-                "safety, and effectiveness. Suggest improvements:\n\n{context}"
+                "safety, and effectiveness. Test the approach where possible and "
+                "suggest concrete improvements:\n\n{context}"
             ),
-            tools_allowed=[],  # analysis only, no tools
+            tools_allowed=["shell_exec", "nmap_scan", "file_read"],
         ),
     ],
     tags=["security", "exploit", "offensive"],
@@ -369,7 +394,7 @@ def list_workflows() -> list[dict]:
     ]
 
 
-def detect_workflow(user_input: str) -> Optional[Workflow]:
+def detect_workflow(user_input: str, min_keyword_score: int = 2) -> Optional[Workflow]:
     """Try to match user input to a pre-built workflow.
 
     Returns the workflow if a strong match is found, else None.
@@ -407,7 +432,7 @@ def detect_workflow(user_input: str) -> Optional[Workflow]:
 
     # Need at least 2 keyword hits to auto-trigger a workflow
     best_name = max(scores, key=scores.get)
-    if scores[best_name] >= 2:
+    if scores[best_name] >= min_keyword_score:
         return WORKFLOW_REGISTRY.get(best_name)
 
     return None

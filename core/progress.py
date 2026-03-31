@@ -131,7 +131,7 @@ class ProgressLedger:
             parts.append("WARNING: You appear stalled — recent actions are all repeats or failures. Try a different approach.")
         return " ".join(parts)
 
-    def reflection_prompt(self, tool: str, args: dict, success: bool, output: str) -> str:
+    def reflection_prompt(self, tool: str, args: dict, success: bool, output: str) -> str:  # noqa: E501
         """Build a reflection prompt after a tool execution."""
         status = "succeeded" if success else "FAILED"
         snippet = output[:300].replace("\n", " ")
@@ -151,3 +151,139 @@ class ProgressLedger:
             )
 
         return "\n".join(lines)
+
+
+# ── OuterTaskLedger (Phase 15) ────────────────────────────────────────────────
+
+from dataclasses import dataclass as _dc, field as _field
+from enum import Enum as _Enum
+from typing import Optional as _Optional
+import time as _time
+
+
+class SubtaskStatus(_Enum):
+    PENDING   = "pending"
+    RUNNING   = "running"
+    DONE      = "done"
+    FAILED    = "failed"
+    SKIPPED   = "skipped"
+
+
+@dataclass
+class SubtaskRecord:
+    """One tracked subtask at the outer (mission) level."""
+    subtask_id: str
+    description: str
+    role: str
+    status: SubtaskStatus = SubtaskStatus.PENDING
+    started_at: float = field(default_factory=_time.time)
+    finished_at: float = 0.0
+    outcome_snippet: str = ""      # first 300 chars of output
+    validation_score: float = -1.0  # -1 means not validated
+
+
+class OuterTaskLedger:
+    """Mission-level tracker — records each subtask and overall goal status.
+
+    Inspired by Microsoft Magentic-One's OuterLoopAgent ledger architecture.
+    The OuterTaskLedger operates at the multiagent level (one per run_mission call),
+    while ProgressLedger operates at the inner agent-loop level (one per agent._agent_loop).
+    """
+
+    def __init__(self, mission: str = "") -> None:
+        self.mission = mission
+        self.subtasks: list[SubtaskRecord] = []
+        self._started_at: float = _time.time()
+
+    # ── Lifecycle ─────────────────────────────────────────────────────────
+
+    def add_subtask(self, subtask_id: str, description: str, role: str) -> SubtaskRecord:
+        rec = SubtaskRecord(subtask_id=subtask_id, description=description, role=role)
+        self.subtasks.append(rec)
+        return rec
+
+    def start_subtask(self, subtask_id: str) -> None:
+        rec = self._find(subtask_id)
+        if rec:
+            rec.status = SubtaskStatus.RUNNING
+            rec.started_at = _time.time()
+
+    def complete_subtask(
+        self,
+        subtask_id: str,
+        outcome: str = "",
+        success: bool = True,
+        validation_score: float = -1.0,
+    ) -> None:
+        rec = self._find(subtask_id)
+        if rec:
+            rec.status = SubtaskStatus.DONE if success else SubtaskStatus.FAILED
+            rec.finished_at = _time.time()
+            rec.outcome_snippet = outcome[:300]
+            rec.validation_score = validation_score
+
+    def skip_subtask(self, subtask_id: str) -> None:
+        rec = self._find(subtask_id)
+        if rec:
+            rec.status = SubtaskStatus.SKIPPED
+            rec.finished_at = _time.time()
+
+    # ── Status ────────────────────────────────────────────────────────────
+
+    def all_done(self) -> bool:
+        return all(
+            r.status in (SubtaskStatus.DONE, SubtaskStatus.FAILED, SubtaskStatus.SKIPPED)
+            for r in self.subtasks
+        )
+
+    def success_rate(self) -> float:
+        done = [r for r in self.subtasks if r.status == SubtaskStatus.DONE]
+        total = len(self.subtasks)
+        return len(done) / total if total else 0.0
+
+    def elapsed(self) -> float:
+        return round(_time.time() - self._started_at, 2)
+
+    # ── Summary ───────────────────────────────────────────────────────────
+
+    def summary(self) -> str:
+        lines = [f"Mission: {self.mission or '(unnamed)'}  [{self.elapsed()}s elapsed]"]
+        for r in self.subtasks:
+            icon = {
+                SubtaskStatus.PENDING:  "○",
+                SubtaskStatus.RUNNING:  "▶",
+                SubtaskStatus.DONE:     "✓",
+                SubtaskStatus.FAILED:   "✗",
+                SubtaskStatus.SKIPPED:  "–",
+            }[r.status]
+            val_str = f"  val={r.validation_score:.2f}" if r.validation_score >= 0 else ""
+            lines.append(f"  {icon} [{r.role}] {r.description[:80]}{val_str}")
+        rate = self.success_rate()
+        lines.append(f"Success rate: {rate:.0%}  ({sum(1 for r in self.subtasks if r.status == SubtaskStatus.DONE)}/{len(self.subtasks)} done)")
+        return "\n".join(lines)
+
+    def to_dict(self) -> dict:
+        return {
+            "mission": self.mission,
+            "elapsed": self.elapsed(),
+            "success_rate": self.success_rate(),
+            "subtasks": [
+                {
+                    "id": r.subtask_id,
+                    "role": r.role,
+                    "description": r.description,
+                    "status": r.status.value,
+                    "validation_score": r.validation_score,
+                    "outcome_snippet": r.outcome_snippet,
+                }
+                for r in self.subtasks
+            ],
+        }
+
+    # ── Internal ──────────────────────────────────────────────────────────
+
+    def _find(self, subtask_id: str) -> _Optional[SubtaskRecord]:
+        for r in self.subtasks:
+            if r.subtask_id == subtask_id:
+                return r
+        return None

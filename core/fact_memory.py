@@ -96,6 +96,9 @@ class FactMemory:
         engagement_id: str = "",
     ):
         """Store a fact.  If engagement_id is provided, scoped to that engagement."""
+        # Normalize keys to lowercase for consistent dedup and case-insensitive querying
+        subject = (subject or "").lower()
+        predicate = (predicate or "").lower()
         self._load()
         fact = Fact(
             subject=subject,

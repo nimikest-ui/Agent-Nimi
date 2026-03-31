@@ -31,6 +31,39 @@ class LLMProvider(ABC):
         """Test if the provider is available."""
         ...
 
+    def chat_vision(
+        self,
+        messages: list[dict],
+        images: list[str],
+        stream: bool = False,
+    ) -> str:
+        """Send messages with images to the LLM.  Default: strip images, fall back to text chat.
+
+        Args:
+            messages: Conversation messages (same format as chat()).
+            images:   List of base64 data-URIs or raw base64 PNG strings.
+            stream:   If True, behaviour depends on subclass; default impl ignores it.
+
+        Subclasses that support vision (e.g. Grok with a vision model) should
+        override this method.  The default implementation falls back to plain text
+        and appends a note that vision content was dropped.
+        """
+        # Build a text-only version of the messages and append a note
+        fallback_messages = list(messages)
+        if images:
+            note = f"[Note: {len(images)} image(s) were provided but this provider does not support vision.]"
+            if fallback_messages and fallback_messages[-1].get("role") == "user":
+                last = dict(fallback_messages[-1])
+                last["content"] = (last.get("content") or "") + "\n" + note
+                fallback_messages[-1] = last
+            else:
+                fallback_messages.append({"role": "user", "content": note})
+        result = self.chat(fallback_messages, stream=False)
+        # chat() can return a Generator when stream=True — force consume it
+        if hasattr(result, "__iter__") and not isinstance(result, str):
+            return "".join(result)
+        return str(result)
+
     def deep_test_connection(self) -> tuple[bool, str]:
         """Test connection with a real inference request.
         

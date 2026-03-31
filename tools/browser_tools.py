@@ -317,6 +317,74 @@ def browser_get_url(session_id: str) -> str:
 
 
 @tool(
+    name="browser_scroll",
+    description="Scroll the page or a specific element up/down by a pixel amount.",
+    manifest={
+        "category": "browser",
+        "action_class": "reversible",
+        "capabilities": ["browser_control"],
+        "trust_tier": "tier_1",
+        "provider_affinity": "any",
+    },
+)
+def browser_scroll(session_id: str, direction: str = "down", pixels: int = 400, selector: str = "") -> str:
+    s = _get_session(session_id)
+    direction = direction.lower()
+    delta_y = pixels if direction == "down" else -pixels
+    delta_x = 0
+    if direction in ("right", "left"):
+        delta_x = pixels if direction == "right" else -pixels
+        delta_y = 0
+    if selector:
+        _submit(s, lambda p, sel, dx, dy: p.eval_on_selector(
+            sel,
+            "(el, [dx, dy]) => el.scrollBy(dx, dy)",
+            [delta_x, delta_y],
+        ), selector, delta_x, delta_y)
+        return f"Scrolled element '{selector}' {direction} by {pixels}px"
+    else:
+        _submit(s, lambda p, dx, dy: p.evaluate("([dx, dy]) => window.scrollBy(dx, dy)", [dx, dy]), delta_x, delta_y)
+        return f"Scrolled page {direction} by {pixels}px"
+
+
+@tool(
+    name="browser_wait",
+    description=(
+        "Wait for a CSS selector to appear on the page (with optional timeout), "
+        "or simply sleep for a given number of milliseconds. "
+        "Use before screenshot after a navigation or form submission."
+    ),
+    manifest={
+        "category": "browser",
+        "action_class": "read_only",
+        "capabilities": ["browser_control"],
+        "trust_tier": "tier_1",
+        "provider_affinity": "any",
+    },
+)
+def browser_wait(
+    session_id: str,
+    selector: str = "",
+    sleep_ms: int = 0,
+    timeout_ms: int = 10000,
+) -> str:
+    s = _get_session(session_id)
+    if selector:
+        _submit(
+            s,
+            lambda p, sel, t: p.wait_for_selector(sel, timeout=t),
+            selector,
+            timeout_ms,
+            timeout=timeout_ms / 1000 + 5,
+        )
+        return f"Element '{selector}' appeared."
+    elif sleep_ms > 0:
+        _submit(s, lambda p, ms: p.wait_for_timeout(ms), sleep_ms, timeout=sleep_ms / 1000 + 5)
+        return f"Waited {sleep_ms}ms."
+    return "No wait condition specified."
+
+
+@tool(
     name="browser_close",
     description="Close a browser session and release its resources.",
     manifest={
@@ -335,3 +403,135 @@ def browser_close(session_id: str) -> str:
     s["stream_active"] = False
     s["_queue"].put(None)
     return f"Browser session {session_id} closed."
+
+
+# ── Set-of-Marks JS (Phase 12 Vision) ────────────────────────────────────────
+
+_SOM_INJECT_JS = """
+(() => {
+  // Remove previous SoM overlays
+  document.querySelectorAll('[data-som-marker]').forEach(el => el.remove());
+
+  const interactive = Array.from(document.querySelectorAll(
+    'a, button, input, select, textarea, [role="button"], [role="link"], ' +
+    '[onclick], [tabindex]:not([tabindex="-1"]), details > summary'
+  ));
+
+  // Filter to only visible, in-viewport elements
+  const visible = interactive.filter(el => {
+    const r = el.getBoundingClientRect();
+    if (r.width === 0 && r.height === 0) return false;
+    const style = getComputedStyle(el);
+    if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') return false;
+    return r.top < window.innerHeight && r.bottom > 0 && r.left < window.innerWidth && r.right > 0;
+  });
+
+  const results = [];
+  visible.forEach((el, i) => {
+    const idx = i + 1;
+    const r = el.getBoundingClientRect();
+
+    // Create overlay marker
+    const marker = document.createElement('div');
+    marker.setAttribute('data-som-marker', idx);
+    marker.style.cssText =
+      `position:fixed;z-index:999999;` +
+      `left:${Math.max(0, r.left - 2)}px;top:${Math.max(0, r.top - 2)}px;` +
+      `min-width:18px;height:18px;` +
+      `background:rgba(255,0,0,0.85);color:#fff;` +
+      `font:bold 11px/18px monospace;text-align:center;` +
+      `border-radius:9px;padding:0 4px;pointer-events:none;`;
+    marker.textContent = idx;
+    document.body.appendChild(marker);
+
+    // Collect metadata
+    const tag = el.tagName.toLowerCase();
+    const type = el.getAttribute('type') || '';
+    const text = (el.innerText || el.value || el.placeholder || el.getAttribute('aria-label') || '').trim().slice(0, 80);
+    const href = el.getAttribute('href') || '';
+    const selector = _buildSelector(el);
+
+    results.push({idx, tag, type, text, href, selector,
+      x: Math.round(r.left + r.width / 2),
+      y: Math.round(r.top + r.height / 2)});
+  });
+
+  function _buildSelector(el) {
+    if (el.id) return '#' + CSS.escape(el.id);
+    const tag = el.tagName.toLowerCase();
+    const cls = Array.from(el.classList).slice(0, 2).map(c => '.' + CSS.escape(c)).join('');
+    if (cls) {
+      const sel = tag + cls;
+      if (document.querySelectorAll(sel).length === 1) return sel;
+    }
+    // Fallback: nth-child
+    const parent = el.parentElement;
+    if (parent) {
+      const siblings = Array.from(parent.children).filter(c => c.tagName === el.tagName);
+      const nth = siblings.indexOf(el) + 1;
+      return _buildSelector(parent) + ' > ' + tag + ':nth-of-type(' + nth + ')';
+    }
+    return tag;
+  }
+
+  return JSON.stringify(results);
+})()
+"""
+
+_SOM_CLEAR_JS = """
+document.querySelectorAll('[data-som-marker]').forEach(el => el.remove());
+'cleared'
+"""
+
+
+@tool(
+    name="browser_annotate",
+    description=(
+        "Overlay numbered red markers on all interactive elements (links, buttons, inputs) "
+        "in the current browser viewport. Returns a JSON array mapping each marker number to "
+        "the element's tag, text, href, CSS selector, and center coordinates (x, y). "
+        "Call browser_screenshot immediately after to get a labeled screenshot for vision analysis."
+    ),
+    manifest={
+        "category": "browser",
+        "action_class": "read_only",
+        "capabilities": ["browser_control", "vision", "set_of_marks"],
+        "trust_tier": "tier_1",
+        "provider_affinity": "any",
+    },
+)
+def browser_annotate(session_id: str) -> str:
+    """Inject Set-of-Marks overlays and return the element map."""
+    s = _get_session(session_id)
+    raw: str = _submit(s, lambda p: p.evaluate(_SOM_INJECT_JS), timeout=8.0)
+    try:
+        import json
+        elements = json.loads(raw)
+    except Exception:
+        return raw  # return raw string if JSON parse fails
+    # Format for LLM consumption
+    lines = [f"[Set-of-Marks] {len(elements)} interactive elements annotated:"]
+    for el in elements:
+        desc = el.get("text") or el.get("href") or el.get("type") or "–"
+        lines.append(
+            f"  [{el['idx']}] <{el['tag']}> \"{desc[:60]}\" "
+            f"sel=\"{el['selector']}\" xy=({el['x']},{el['y']})"
+        )
+    return "\n".join(lines)
+
+
+@tool(
+    name="browser_clear_marks",
+    description="Remove all Set-of-Marks overlays from the browser page.",
+    manifest={
+        "category": "browser",
+        "action_class": "read_only",
+        "capabilities": ["browser_control"],
+        "trust_tier": "tier_1",
+        "provider_affinity": "any",
+    },
+)
+def browser_clear_marks(session_id: str) -> str:
+    s = _get_session(session_id)
+    _submit(s, lambda p: p.evaluate(_SOM_CLEAR_JS), timeout=5.0)
+    return "Set-of-Marks overlays cleared."

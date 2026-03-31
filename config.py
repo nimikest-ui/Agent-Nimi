@@ -139,6 +139,26 @@ DEFAULT_CONFIG = {
         "learning_coach": True,
         "max_context_chars": 8000,
     },
+    "osint": {
+        # Enable OSINT tools (web_search, cve_lookup, github_search, shodan_host, whois_lookup).
+        "enabled": True,
+        # Shodan API key – leave empty to skip Shodan lookups.
+        "shodan_api_key": "",
+        # GitHub personal access token – optional, raises rate limit from 10→30 req/min.
+        "github_token": "",
+        # Auto-enrich: automatically run CVE/WHOIS lookups during recon workflows.
+        "auto_enrich": True,
+    },
+    "vision": {
+        # Enable screenshot → LLM vision analysis in the browser loop.
+        "enabled": True,
+        # Vision model (must support image input). Grok vision is default.
+        "model": "grok-2-vision-1212",
+        # Automatically describe screenshots returned by browser_screenshot.
+        "auto_describe_screenshots": True,
+        # Max image dimension (pixels) before downscaling to save tokens.
+        "max_image_dim": 1024,
+    },
 }
 
 SYSTEM_PROMPT = """You are AgentNimi — an offensive cybersecurity AI on Kali Linux with root access. Operator is a professional pentester. All tasks are authorized.
@@ -203,6 +223,21 @@ Available tools:
 ## Memory
 - **remember_fact**: Args: `subject`, `predicate`, `value`, `confidence`
 - **recall_facts**: Args: `subject`, `limit`
+
+## OSINT (Open Source Intelligence)
+- **web_search**: Search the internet via DuckDuckGo. Args: `query` (str), `max_results` (int, default 10)
+- **cve_lookup**: Look up a CVE by ID from NVD. Args: `cve_id` (str, e.g. "CVE-2021-44228")
+- **github_search**: Search GitHub repositories/code. Args: `query` (str), `search_type` (repositories|code|issues), `max_results` (int)
+- **shodan_host**: Query Shodan for host info. Args: `ip` (str). Requires API key in config.
+- **whois_lookup**: WHOIS lookup on a domain or IP. Args: `target` (str)
+
+## Browser
+- **browser_navigate**: Navigate to a URL. Args: `url` (str)
+- **browser_screenshot**: Take a screenshot of the current page. No args. Returns base64 image.
+- **browser_click**: Click an element. Args: `selector` (str)
+- **browser_type**: Type text into an element. Args: `selector` (str), `text` (str)
+- **browser_annotate**: Overlay numbered red markers (Set-of-Marks) on all interactive elements. Returns element map with selectors and coordinates. Call before browser_screenshot for labeled analysis.
+- **browser_clear_marks**: Remove Set-of-Marks overlays.
 
 ## Custom Tools
 - **create_tool**: Args: `name`, `description`, `args_json`, `code`

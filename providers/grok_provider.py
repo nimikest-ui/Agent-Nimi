@@ -61,6 +61,61 @@ class GrokProvider(LLMProvider):
                         except json.JSONDecodeError:
                             continue
 
+    def chat_vision(
+        self,
+        messages: list[dict],
+        images: list[str],
+        stream: bool = False,
+    ) -> str:
+        """Send text + images to grok-2-vision-1212 or the configured model if it supports vision."""
+        import base64 as _b64
+
+        # Build content list with interleaved text and image blocks
+        vision_messages: list[dict] = []
+        for msg in messages:
+            role = msg.get("role", "user")
+            content = msg.get("content") or ""
+            if role == "user" and not vision_messages or messages.index(msg) == len(messages) - 1:
+                # Attach images to the LAST user message only
+                vision_messages.append({"role": role, "content": content})
+            else:
+                vision_messages.append({"role": role, "content": content})
+
+        # Inject images into the last user message as a content array
+        for i in range(len(vision_messages) - 1, -1, -1):
+            if vision_messages[i].get("role") == "user":
+                text_content = vision_messages[i].get("content", "")
+                content_blocks: list[dict] = [{"type": "text", "text": text_content}]
+                for img in images:
+                    # Normalise: strip data URI prefix to get raw base64
+                    if isinstance(img, str) and img.startswith("data:"):
+                        # e.g. data:image/png;base64,XXXX
+                        _, b64_part = img.split(",", 1)
+                    else:
+                        b64_part = img
+                    content_blocks.append({
+                        "type": "image_url",
+                        "image_url": {
+                            "url": f"data:image/png;base64,{b64_part}",
+                            "detail": "high",
+                        },
+                    })
+                vision_messages[i] = {"role": "user", "content": content_blocks}
+                break
+
+        # Use a vision-capable model; prefer the dedicated vision model if configured
+        vision_model = self.config.get("vision_model") or "grok-2-vision-1212"
+        url = f"{self.base_url}/chat/completions"
+        payload = {
+            "model": vision_model,
+            "messages": vision_messages,
+            "stream": False,
+            "max_tokens": 2048,
+        }
+        resp = requests.post(url, json=payload, headers=self._headers(), timeout=120)
+        resp.raise_for_status()
+        return resp.json()["choices"][0]["message"]["content"]
+
     def test_connection(self) -> bool:
         if not self.api_key:
             return False

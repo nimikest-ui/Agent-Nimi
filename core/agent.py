@@ -13,6 +13,7 @@ from config import load_config, SYSTEM_PROMPT
 from providers import get_provider
 from tools import run_tool, parse_tool_call, list_tools
 from tools.registry import get_tool as get_tool_info, ACTION_CLASSES
+from tools.shell_tools import start_network_watchdog, is_network_disconnect_command
 from core.audit import audit_event
 from core.decomposer import decompose_mission
 from core.progress import ProgressLedger
@@ -70,6 +71,9 @@ class AgentNimi:
         # ── Workflow support (Phase 9) ────────────────────────────────────
         # Set by run_workflow() to restrict allowed tools during a step
         self._workflow_tools_allowed = None
+
+        # ── Network watchdog (disconnect failsafe) ────────────────────────
+        start_network_watchdog(self.config)
 
     def steer(self, message: str):
         """Inject a steering message into the running agent loop."""
@@ -145,7 +149,8 @@ class AgentNimi:
         # explicitly when needed.  Auto-injecting all stored facts causes stale
         # data from past engagements to bleed into unrelated conversations.
         if episodic_context:
-            self.messages.append({"role": "user", "content": episodic_context})
+            # Use system role to avoid consecutive user messages (rejected by most LLM APIs)
+            self.messages.append({"role": "system", "content": episodic_context})
 
         self.messages.append({"role": "user", "content": user_input})
 
@@ -170,7 +175,8 @@ class AgentNimi:
         workflow_conf = self.config.get("workflow", {})
         if workflow_conf.get("enabled", True) and self._current_mode == "agent":
             from core.workflows import detect_workflow, run_workflow as _run_workflow
-            detected_wf = detect_workflow(user_input)
+            min_score = workflow_conf.get("min_keyword_score", 2)
+            detected_wf = detect_workflow(user_input, min_keyword_score=min_score)
             # Also trigger workflow if strategy memory says so
             if not detected_wf and recommended_strategy.startswith("workflow:"):
                 wf_name = recommended_strategy.split(":", 1)[1]
@@ -248,6 +254,7 @@ class AgentNimi:
         from core.evaluator import AutoEvaluator
         _reflexion_evaluator = AutoEvaluator()
         final_issues: list[str] = []
+        retry_ran: bool = False  # True only when _agent_loop is actually called a second time
 
         for attempt in range(max_refinements):
             quick = _reflexion_evaluator.evaluate_quick(
@@ -262,6 +269,7 @@ class AgentNimi:
                 break  # good enough
 
             # Feed critique back and retry
+            retry_ran = True
             issues_text = ", ".join(final_issues) if final_issues else "low overall quality"
             audit_event("reflexion_retry", {
                 "attempt": attempt + 1,
@@ -331,7 +339,7 @@ class AgentNimi:
         # ── Store episode in episodic memory ──────────────────────────────────
         try:
             tools_used = list({e["tool"] for e in self.command_log[-20:]})
-            strategy = "reflexion_retry" if final_issues else "direct"
+            strategy = "reflexion_retry" if retry_ran else "direct"
             self.episodic_memory.store_from_interaction(
                 user_input=user_input,
                 response=response,
@@ -348,7 +356,7 @@ class AgentNimi:
         # ── Record strategy outcome (Phase 10.2) ─────────────────────────────
         try:
             tools_used_strat = list({e["tool"] for e in self.command_log[-20:]})
-            strat_name = "reflexion_retry" if final_issues else "direct"
+            strat_name = "reflexion_retry" if retry_ran else "direct"
             self.strategy_memory.record(
                 task_type=_final_task_type,
                 strategy=strat_name,
@@ -393,6 +401,17 @@ class AgentNimi:
         )
         return viewing_phrase or (deictic and asset_noun)
 
+    # Conversational inputs that should never trigger multiagent
+    _CONVERSATIONAL_PATTERNS = {
+        "hi", "hey", "hello", "yo", "sup", "howdy",
+        "ok", "okay", "k", "yep", "yes", "no", "nope", "nah",
+        "thanks", "thank you", "thx", "ty",
+        "great", "nice", "cool", "perfect", "good", "got it", "noted",
+        "sure", "fine", "alright", "sounds good",
+        "stop", "quit", "exit", "done",
+        "help", "?",
+    }
+
     # Words/phrases that indicate a direct single-action request —
     # no need for multiagent decomposition.
     # Only truly single-tool, trivial commands.
@@ -416,6 +435,21 @@ class AgentNimi:
         Keeps the bar HIGH so complex/multi-step tasks reach multiagent.
         """
         text = (user_input or "").strip().lower()
+        if not text:
+            return True
+
+        # Conversational / greeting inputs — never multiagent
+        if text in self._CONVERSATIONAL_PATTERNS:
+            return True
+        # Very short inputs with no action vocabulary → treat as conversational
+        words = text.split()
+        if len(words) <= 3 and not any(
+            kw in text for kw in (
+                "scan", "run", "exec", "find", "show", "list", "get",
+                "install", "check", "enum", "recon", "exploit",
+            )
+        ):
+            return True
         # Multi-step markers → never simple
         multi_markers = [" then ", " and then ", " after that ", " next ", " finally ",
                          "step 1", "step 2", "first,", "second,", " and also ",
@@ -436,8 +470,11 @@ class AgentNimi:
 
     def _should_use_multiagent(self, user_input: str, mconf: dict) -> bool:
         """Use multiagent only when the mission naturally decomposes into multiple segments."""
-        # Fast-path: simple single-action requests skip multiagent entirely
+        # Fast-path: simple / conversational requests skip multiagent entirely
         if self._is_simple_request(user_input):
+            return False
+        # Don't bother decomposing very short inputs — the LLM will invent subtasks
+        if len((user_input or "").split()) < 5:
             return False
         try:
             max_subtasks = int(mconf.get("max_subtasks", 5) or 5)
@@ -786,7 +823,6 @@ class AgentNimi:
         - Progress summaries injected every N iterations
         - Safeguards against stuck loops (unrecognized tools, repeated failures)
         """
-        self._cancelled = False
         full_response_parts = []
         ledger = ProgressLedger()
         reflection_conf = self.config.get("reflexion", {})
@@ -993,6 +1029,71 @@ class AgentNimi:
             if len(output) > 15000:
                 output = output[:15000] + "\n\n[...output truncated for context length...]"
 
+            # ── Vision-in-the-loop: describe screenshots via LLM (Phase 11+12) ─
+            _vision_cfg = self.config.get("vision", {})
+            _vision_enabled = _vision_cfg.get("enabled", True)
+            _auto_som = _vision_cfg.get("auto_describe_screenshots", True)
+            if _vision_enabled and tool_name == "browser_screenshot" and result["success"] and output.startswith("data:image"):
+                try:
+                    # ── Set-of-Marks: auto-annotate before vision analysis ────
+                    som_context = ""
+                    if _auto_som:
+                        try:
+                            from tools.browser_tools import browser_annotate
+                            sid = tool_args.get("session_id", "")
+                            if sid:
+                                som_result = browser_annotate(session_id=sid)
+                                if som_result and "[Set-of-Marks]" in som_result:
+                                    som_context = som_result
+                                    # Re-capture screenshot WITH the SoM overlays
+                                    from tools.browser_tools import browser_screenshot as _bs
+                                    annotated_shot = _bs(session_id=sid)
+                                    if annotated_shot.startswith("data:image"):
+                                        output = annotated_shot
+                                    # Clean up overlays for next interaction
+                                    from tools.browser_tools import browser_clear_marks
+                                    browser_clear_marks(session_id=sid)
+                        except Exception:
+                            pass  # SoM is a nice-to-have, don't fail the whole vision flow
+
+                    vision_prompt = (
+                        "Describe this browser screenshot in detail. "
+                        "Identify visible UI elements, text content, URLs, form fields, "
+                        "error messages, and anything security-relevant. "
+                        "Be specific and thorough — your description will be used for further analysis."
+                    )
+                    if som_context:
+                        vision_prompt += (
+                            "\n\nThe screenshot has numbered red markers (Set-of-Marks) "
+                            "overlaid on interactive elements. Here is the element map:\n"
+                            + som_context
+                            + "\n\nReference elements by their marker number [N] in your description."
+                        )
+
+                    vision_messages = list(self.messages) + [
+                        {"role": "assistant", "content": response_text},
+                        {"role": "user", "content": vision_prompt},
+                    ]
+                    vision_provider = self.provider
+                    description = vision_provider.chat_vision(
+                        messages=vision_messages,
+                        images=[output],
+                        stream=False,
+                    )
+                    if stream_callback:
+                        stream_callback({
+                            "event": "vision_description",
+                            "session_id": tool_args.get("session_id", ""),
+                            "description": description[:500],
+                            "som_elements": som_context[:300] if som_context else "",
+                        })
+                    output = f"[Screenshot captured — vision analysis]\n{description}"
+                    if som_context:
+                        output += f"\n\n{som_context}"
+                except Exception as _vision_err:
+                    # Vision unavailable: fall back to noting the screenshot was captured
+                    output = f"[Screenshot captured — vision analysis unavailable: {_vision_err}]\nRaw data URI length: {len(result['output'])} chars."
+
             # Notify tool result
             if stream_callback:
                 stream_callback({
@@ -1156,13 +1257,24 @@ class AgentNimi:
     def _safety_check(self, tool_name: str, args: dict) -> bool:
         """Check if a tool call is safe to execute."""
         blocked = self.safety.get("blocked_commands", [])
-        
-        # Check shell commands against blocklist
+
+        # Check tool name directly against blocklist (covers any tool type)
+        if tool_name in blocked:
+            return False
+
+        # For shell commands, also check the command string against each blocked pattern
         if tool_name in ("shell_exec", "shell_exec_background"):
             cmd = args.get("command", "")
             for blocked_cmd in blocked:
                 if blocked_cmd in cmd:
                     return False
+
+            # Block commands that would disconnect the network (failsafe)
+            if self.safety.get("block_network_disconnect", True):
+                if is_network_disconnect_command(cmd):
+                    audit_event("network_disconnect_blocked", {"command": cmd[:200]})
+                    return False
+
         return True
 
     # ─────────────────────────────────────────────────────────────────────
@@ -1345,10 +1457,10 @@ class AgentNimi:
             # Skip tool results and system messages in summary
 
         if summary_parts:
-            compressed = "\\n".join(summary_parts[-15:])  # keep last 15 entries
+            compressed = "\n".join(summary_parts[-15:])  # keep last 15 entries
             summary_msg = {
                 "role": "system",
-                "content": f"[CONTEXT SUMMARY — earlier conversation compressed]\\n{compressed}",
+                "content": f"[CONTEXT SUMMARY — earlier conversation compressed]\n{compressed}",
             }
             self.messages = [system, summary_msg] + recent
             audit_event("context_compressed", {

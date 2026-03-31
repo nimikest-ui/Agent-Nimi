@@ -125,8 +125,8 @@ def chat():
     req_key = data.get("api_key", "").strip()
     
     if req_provider:
-        if req_key:
-            state.config["providers"].setdefault(req_provider, {})["api_key"] = req_key
+        # Note: API key changes are NOT accepted from the chat endpoint for security.
+        # Keys must be set via config file or a dedicated /api/providers endpoint.
         if req_model:
             state.config["providers"].setdefault(req_provider, {})["model"] = req_model
     

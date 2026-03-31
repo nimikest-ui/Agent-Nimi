@@ -4,6 +4,8 @@ import shutil
 import subprocess
 from typing import Generator
 
+import requests
+
 from .base import LLMProvider, register_provider
 
 
@@ -212,3 +214,66 @@ class CopilotProvider(LLMProvider):
             return False, "copilot CLI timed out"
         except Exception as e:
             return False, str(e)
+
+    # ── Vision via GitHub Models REST API ────────────────────────────────
+
+    def chat_vision(
+        self,
+        messages: list[dict],
+        images: list[str],
+        stream: bool = False,
+    ) -> str:
+        """Send messages + images via the GitHub Models REST API.
+
+        The CLI doesn't support image input, so we fall back to the REST
+        endpoint (``self.base_url``) which accepts OpenAI-compatible
+        multi-modal content arrays.
+        """
+        if not self.api_key:
+            # No API key — fall back to base class (text-only)
+            return super().chat_vision(messages, images, stream)
+
+        base = (self.config.get("base_url") or "https://models.github.ai").rstrip("/")
+        url = f"{base}/chat/completions"
+        # Use a vision-capable model; gpt-4o handles images well on GitHub Models
+        vision_model = self.config.get("vision_model") or "gpt-4o"
+
+        # Build vision messages: inject images into the last user message
+        vision_msgs: list[dict] = []
+        for msg in messages:
+            vision_msgs.append({"role": msg.get("role", "user"), "content": msg.get("content", "")})
+
+        # Find the last user message and replace its content with a content array
+        for i in range(len(vision_msgs) - 1, -1, -1):
+            if vision_msgs[i].get("role") == "user":
+                text = vision_msgs[i].get("content", "")
+                blocks: list[dict] = [{"type": "text", "text": text}]
+                for img in images:
+                    if isinstance(img, str) and img.startswith("data:"):
+                        _, b64 = img.split(",", 1)
+                    else:
+                        b64 = img
+                    blocks.append({
+                        "type": "image_url",
+                        "image_url": {"url": f"data:image/png;base64,{b64}", "detail": "auto"},
+                    })
+                vision_msgs[i] = {"role": "user", "content": blocks}
+                break
+
+        headers = {
+            "Authorization": f"Bearer {self.api_key}",
+            "Content-Type": "application/json",
+        }
+        payload = {
+            "model": vision_model,
+            "messages": vision_msgs,
+            "stream": False,
+            "max_tokens": 2048,
+        }
+        try:
+            resp = requests.post(url, json=payload, headers=headers, timeout=120)
+            resp.raise_for_status()
+            return resp.json()["choices"][0]["message"]["content"]
+        except Exception as e:
+            # Fall back to text-only via base class
+            return super().chat_vision(messages, images, stream)

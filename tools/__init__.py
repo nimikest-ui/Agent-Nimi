@@ -10,6 +10,11 @@ try:
 except Exception as _bt_err:
     import sys
     print(f"  ⚠️ browser_tools not loaded: {_bt_err}", file=sys.stderr)
+try:
+    from . import osint_tools
+except Exception as _ot_err:
+    import sys
+    print(f"  ⚠️ osint_tools not loaded: {_ot_err}", file=sys.stderr)
 from .custom_loader import load_all_custom_tools, create_custom_tool, delete_custom_tool, list_custom_tools
 
 # Load user-defined custom tools from disk
