@@ -40,9 +40,8 @@ def create_conversation():
     conversation_service.save_conversation(conv_id, conv)
     state.set_current_conv_id(conv_id)
     
-    # Reset agent conversation
-    if state.agent:
-        state.agent.reset_conversation()
+    # Remove any stale pool agent for a brand-new conversation
+    state.remove_agent(conv_id)
     
     return jsonify(conv)
 
@@ -70,8 +69,8 @@ def delete_conversation(conv_id):
     
     if state.current_conv_id == conv_id:
         state.set_current_conv_id(None)
-        if state.agent:
-            state.agent.reset_conversation()
+    state.cancel_conv(conv_id, timeout=3.0)
+    state.remove_agent(conv_id)
     clear_engagement(conv_id)
     
     return jsonify({"success": True, "archived": True})
@@ -84,9 +83,9 @@ def clear_recent_conversations():
     
     if state.current_conv_id in archived_ids:
         state.set_current_conv_id(None)
-        if state.agent:
-            state.agent.reset_conversation()
     for conv_id in archived_ids:
+        state.cancel_conv(conv_id, timeout=2.0)
+        state.remove_agent(conv_id)
         clear_engagement(conv_id)
     
     return jsonify({"success": True, "archived_count": len(archived_ids)})
@@ -102,10 +101,14 @@ def load_conversation(conv_id):
     state.set_current_conv_id(conv_id)
     clear_engagement(conv_id)
     
-    # Rebuild agent messages from conversation history
-    if state.agent:
-        state.agent.messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+    # Rebuild the pool agent's messages from conversation history —
+    # but ONLY if the agent is idle. If it's actively running we must
+    # not overwrite its messages mid-loop.
+    t = state.get_conv_thread(conv_id)
+    if t is None or not t.is_alive():
+        agent = state.get_agent(conv_id)
+        agent.messages = [{"role": "system", "content": SYSTEM_PROMPT}]
         for msg in conv.get("messages", []):
-            state.agent.messages.append({"role": msg["role"], "content": msg["content"]})
+            agent.messages.append({"role": msg["role"], "content": msg["content"]})
     
     return jsonify({"success": True, "conversation": conv})

@@ -148,9 +148,20 @@ class AgentNimi:
         # Global facts are NOT auto-injected — the agent uses recall_facts tool
         # explicitly when needed.  Auto-injecting all stored facts causes stale
         # data from past engagements to bleed into unrelated conversations.
-        if episodic_context:
-            # Use system role to avoid consecutive user messages (rejected by most LLM APIs)
-            self.messages.append({"role": "system", "content": episodic_context})
+
+        # ── Inject knowledge base context (uploaded documents) ────────────────
+        kb_context = ""
+        try:
+            from core.knowledge_base import get_context_for_prompt
+            kb_context = get_context_for_prompt(user_input, max_chars=3000)
+        except Exception:
+            pass  # KB unavailable — no-op
+
+        # Merge episodic + KB into a single system message to avoid consecutive
+        # system-role messages which some LLM APIs reject (especially reasoning models).
+        context_parts = [p for p in (episodic_context, kb_context) if p]
+        if context_parts:
+            self.messages.append({"role": "system", "content": "\n\n".join(context_parts)})
 
         self.messages.append({"role": "user", "content": user_input})
 

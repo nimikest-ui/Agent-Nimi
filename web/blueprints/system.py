@@ -21,6 +21,7 @@ def get_system_info():
         return jsonify({"error": "Monitor not initialized"}), 500
     
     stats = state.monitor.get_stats()
+    stats["agent_pool"] = state.pool_stats()
     return jsonify(stats)
 
 

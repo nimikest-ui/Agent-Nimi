@@ -54,11 +54,22 @@ document.addEventListener('DOMContentLoaded', () => {
   // Quick buttons
   document.querySelectorAll('.quick-btn').forEach(btn => {
     btn.addEventListener('click', () => {
-      const text = btn.dataset.msg;
-      if (text) {
-        document.getElementById('user-input').value = text;
-        sendMessage();
+      let text = btn.dataset.msg;
+      if (!text) return;
+      const targetInput = document.getElementById('target-input');
+      const target = (targetInput?.value || '').trim();
+      const needsTarget = btn.dataset.needsTarget === 'true';
+      if (needsTarget && !target) {
+        // Flash the target input to draw attention
+        targetInput?.focus();
+        targetInput?.classList.add('target-flash');
+        setTimeout(() => targetInput?.classList.remove('target-flash'), 800);
+        return;
       }
+      // Replace {target} — use 'this machine' as default for local-only buttons
+      text = text.replace(/\{target\}/g, target || 'this machine');
+      document.getElementById('user-input').value = text;
+      sendMessage();
     });
   });
 
@@ -140,6 +151,7 @@ document.addEventListener('DOMContentLoaded', () => {
   });
 
   // Init
+  loadProviderCards();
   loadStatus();
   loadConversations().then(() => {
     // Auto-load a conversation specified via ?conv=<id> in the URL.
@@ -154,6 +166,19 @@ document.addEventListener('DOMContentLoaded', () => {
   });
   loadRouterStatus();
   loadTools();
+  loadDocuments();
+
+  // Document upload handler
+  document.getElementById('doc-file-input')?.addEventListener('change', (e) => {
+    const file = e.target.files?.[0];
+    if (file) uploadDocument(file);
+    e.target.value = '';  // reset so same file can be re-uploaded
+  });
+
+  // Document search on Enter
+  document.getElementById('doc-search-input')?.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') searchKB();
+  });
 });
 
 // ── Settings toggle ────────────────────────────────────────────────────────
@@ -164,6 +189,14 @@ function toggleSettings(name) {
   const open = body.style.display === 'flex';
   body.style.display = open ? 'none' : 'flex';
   if (chev) chev.classList.toggle('open', !open);
+}
+
+function collapseSettings(name) {
+  const body = document.getElementById('settings-body-' + name);
+  const chev = document.getElementById('chevron-' + name);
+  if (!body) return;
+  body.style.display = 'none';
+  if (chev) chev.classList.remove('open');
 }
 
 // ── Conversations ───────────────────────────────────────────────────────────
@@ -282,6 +315,16 @@ function resetConversationDeleteConfirmation() {
 }
 
 async function newChat() {
+  // Detach from active stream but do NOT cancel the agent —
+  // it keeps running in the per-conversation pool.
+  if (isStreaming) {
+    abortController?.abort();
+    finalizeMessage();
+    isStreaming = false;
+    abortController = null;
+    document.getElementById('btn-send').style.display = '';
+    document.getElementById('btn-stop').classList.remove('visible');
+  }
   try {
     const r = await fetch('/api/conversations', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({title:'New Chat'})});
     const data = await r.json();
@@ -296,6 +339,16 @@ async function newChat() {
 
 async function switchConversation(id) {
   if (id === currentConvId && isStreaming) return;
+  // Detach the SSE reader but do NOT cancel the server-side agent —
+  // it keeps running in the pool so progress is preserved.
+  if (isStreaming) {
+    abortController?.abort();
+    finalizeMessage();
+    isStreaming = false;
+    abortController = null;
+    document.getElementById('btn-send').style.display = '';
+    document.getElementById('btn-stop').classList.remove('visible');
+  }
   try {
     const r = await fetch('/api/conversations/' + id + '/load', {method:'POST'});
     if (!r.ok) return;
@@ -307,11 +360,13 @@ async function switchConversation(id) {
     msgs.innerHTML = '';
     (conv.messages || []).forEach(m => {
       if (m.role === 'user') appendUserMessage(m.content);
-      else if (m.role === 'assistant') appendAssistantHistory(m.content);
+      else if (m.role === 'assistant') appendAssistantHistory(m.content, m.events);
     });
     document.getElementById('welcome').style.display = msgs.children.length ? 'none' : '';
     await loadConversations();
+    autoScrollEnabled = true;
     scrollToBottom();
+    document.getElementById('user-input')?.focus();
   } catch(e) {}
 }
 
@@ -499,6 +554,12 @@ async function sendMessage() {
 
 function stopGeneration() {
   abortController?.abort();
+  // Tell the server to cancel only this conversation's agent
+  if (currentConvId) {
+    fetch('/api/cancel', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({conversation_id: currentConvId})}).catch(()=>{});
+  } else {
+    fetch('/api/cancel', {method:'POST'}).catch(()=>{});
+  }
 }
 
 async function clearChat() {
@@ -515,11 +576,14 @@ async function clearChat() {
 function handleEvent(ev) {
   if (!ev || !ev.type) return;
   const pills = currentAssistantDiv?.querySelector('.event-pills');
-  const addPill = (cls, html) => {
+  const addPill = (cls, html, evData) => {
     if (!pills) return;
     const p = document.createElement('div');
     p.className = 'pill pill-flash ' + cls;
     p.innerHTML = html;
+    if (evData) p._evData = evData;
+    p.style.cursor = 'pointer';
+    p.addEventListener('click', () => togglePillDetail(p));
     pills.appendChild(p);
     scrollToBottom();
   };
@@ -542,28 +606,28 @@ function handleEvent(ev) {
 
   switch(ev.type) {
     case 'task_classified':
-      addPill('task-classified', '&#x1F4CB; ' + escapeHtml(ev.task_type || 'task'));
+      addPill('task-classified', '&#x1F4CB; ' + escapeHtml(ev.task_type || 'task'), ev);
       setStatus(escapeHtml(ev.task_type || 'task') + '…');
       setReasoningProgress(8, 'task classified');
       break;
     case 'agent_start':
-      addPill('agent-start', '&#x25B6; agent starting&hellip;');
+      addPill('agent-start', '&#x25B6; agent starting&hellip;', ev);
       setStatus('agent starting…');
       setReasoningProgress(12, 'agent starting');
       break;
     case 'mode_switched':
-      addPill('thinking-pill', '&#x1F504; mode switched &rarr; ' + escapeHtml(ev.mode || ''));
+      addPill('thinking-pill', '&#x1F504; mode switched &rarr; ' + escapeHtml(ev.mode || ''), ev);
       setMode(ev.mode || currentMode);
       break;
     case 'routed': {
       const rtEl = document.getElementById('router-routed-to');
       if (rtEl) { rtEl.textContent = '→ ' + (ev.model || ''); rtEl.style.display = 'block'; }
-      addPill('routed-pill', '&#x1F500; routed &rarr; ' + escapeHtml(ev.model || ''));
+      addPill('routed-pill', '&#x1F500; routed &rarr; ' + escapeHtml(ev.model || ''), ev);
       setReasoningProgress(18, 'provider routed');
       break;
     }
     case 'multiagent_start': {
-      addPill('agent-start', '&#x1F9E0; multiagent start (' + escapeHtml(String((ev.roles || []).length)) + ' roles)');
+      addPill('agent-start', '&#x1F9E0; multiagent start (' + escapeHtml(String((ev.roles || []).length)) + ' roles)', ev);
       setStatus('spawning roles…');
       setReasoningProgress(22, 'multiagent started');
       // Build role progress track
@@ -584,17 +648,18 @@ function handleEvent(ev) {
       break;
     }
     case 'subtask_escalated':
-      addPill('thinking-pill', '&#x26A0; escalated ' + escapeHtml(ev.role || '') + ' from ' + escapeHtml(ev.from || ''));
+      addPill('thinking-pill', '&#x26A0; escalated ' + escapeHtml(ev.role || '') + ' from ' + escapeHtml(ev.from || ''), ev);
       break;
     case 'subtask_stuck':
-      addPill('tool-blocked', '&#x26D4; stuck: ' + escapeHtml(ev.role || '') + ' (' + escapeHtml(ev.task_type || '') + ')');
+      addPill('tool-blocked', '&#x26D4; stuck: ' + escapeHtml(ev.role || '') + ' (' + escapeHtml(ev.task_type || '') + ')', ev);
       break;
     case 'subtask_routed': {
       const tools = renderToolBadges(ev.recommended_tools || []);
       addPill(
         'routed-pill',
         '&#x1F9E9; ' + escapeHtml(ev.role || '') + ' &rarr; ' + escapeHtml(ev.provider || '') +
-        (ev.model ? ':' + escapeHtml(ev.model) : '') + tools
+        (ev.model ? ':' + escapeHtml(ev.model) : '') + tools,
+        ev
       );
       // Mark role as running in tracker
       if (currentRoleTrack) {
@@ -623,32 +688,32 @@ function handleEvent(ev) {
       break;
     }
     case 'boss_routed':
-      addPill('routed-pill', '&#x1F451; boss synthesis &rarr; ' + escapeHtml(ev.provider || '') + (ev.model ? ':' + escapeHtml(ev.model) : ''));
+      addPill('routed-pill', '&#x1F451; boss synthesis &rarr; ' + escapeHtml(ev.provider || '') + (ev.model ? ':' + escapeHtml(ev.model) : ''), ev);
       setStatus('boss synthesizing…');
       setReasoningProgress(70, 'synthesizing');
       break;
     case 'boss_approved':
-      addPill('agent-done-pill', '&#x2714; synthesis approved');
+      addPill('agent-done-pill', '&#x2714; synthesis approved', ev);
       setStatus('finalizing…');
       setReasoningProgress(88, 'approved');
       break;
     case 'boss_refinement':
-      addPill('thinking-pill', '&#x1F504; refining synthesis (attempt ' + (ev.attempt || '') + ')');
+      addPill('thinking-pill', '&#x1F504; refining synthesis (attempt ' + (ev.attempt || '') + ')', ev);
       setStatus('refining…');
       bumpReasoningProgress(2, 'refining');
       break;
     case 'multiagent_replan':
-      addPill('thinking-pill', '&#x1F501; replanning (' + (ev.new_subtasks || 0) + ' new tasks)');
+      addPill('thinking-pill', '&#x1F501; replanning (' + (ev.new_subtasks || 0) + ' new tasks)', ev);
       setStatus('replanning…');
       bumpReasoningProgress(2, 'replanning');
       break;
     case 'mission_iteration':
-      addPill('thinking-pill', '&#x1F504; mission iter ' + (ev.iteration||1) + '/' + (ev.max||'?') + (ev.blockers ? ' (' + ev.blockers + ' blockers)' : ''));
+      addPill('thinking-pill', '&#x1F504; mission iter ' + (ev.iteration||1) + '/' + (ev.max||'?') + (ev.blockers ? ' (' + ev.blockers + ' blockers)' : ''), ev);
       setStatus('mission iteration ' + (ev.iteration||1) + '…');
       bumpReasoningProgress(2, 'mission iteration');
       break;
     case 'mission_adapting':
-      addPill('agent-done-pill', '&#x1F9E0; adapting &mdash; pivoting strategy&#8230;');
+      addPill('agent-done-pill', '&#x1F9E0; adapting &mdash; pivoting strategy&#8230;', ev);
       setStatus('adapting… finding new approach');
       bumpReasoningProgress(2, 'adapting');
       break;
@@ -659,7 +724,7 @@ function handleEvent(ev) {
       setReasoningProgress(100, 'done');
       break;
     case 'iteration':
-      addPill('thinking-pill', '&#x1F914; iteration ' + (ev.current || ev.iteration || ''));
+      addPill('thinking-pill', '&#x1F914; iteration ' + (ev.current || ev.iteration || ''), ev);
       bumpReasoningProgress(3, 'iteration');
       break;
     case 'llm_call_start':
@@ -675,12 +740,12 @@ function handleEvent(ev) {
       break;
     case 'llm_call_done':
       currentAssistantDiv?.querySelector('.typing-dot')?.remove();
-      addPill('thinking-pill', '&#x26A1; ' + (ev.tokens||'') + ' tok ' + (ev.duration_ms ? (ev.duration_ms/1000).toFixed(1)+'s' : ''));
+      addPill('thinking-pill', '&#x26A1; ' + (ev.tokens||'') + ' tok ' + (ev.duration_ms ? (ev.duration_ms/1000).toFixed(1)+'s' : ''), ev);
       setStatus('processing…');
       bumpReasoningProgress(4, 'llm done');
       break;
     case 'safety_check':
-      addPill('safety-pill', '&#x1F6E1; safety: ' + (ev.verdict||'ok'));
+      addPill('safety-pill', '&#x1F6E1; safety: ' + (ev.verdict||'ok'), ev);
       break;
     case 'tool_start':
       createTerminalWidget(ev);
@@ -698,43 +763,46 @@ function handleEvent(ev) {
         p.className = 'pill learning-pill';
         p.innerHTML = '<span>&#x1F393; learning score: ' + (ev.score||'') + '</span>' +
           (ev.summary ? '<span style="font-size:10px;opacity:.8">' + escapeHtml(ev.summary) + '</span>' : '');
+        p._evData = ev;
+        p.style.cursor = 'pointer';
+        p.addEventListener('click', () => togglePillDetail(p));
         pills.appendChild(p);
       }
       break;
     case 'agent_done':
-      addPill('agent-done-pill', '&#x2705; done' + (ev.iterations ? ' (' + ev.iterations + ' iters)' : ''));
+      addPill('agent-done-pill', '&#x2705; done' + (ev.iterations ? ' (' + ev.iterations + ' iters)' : ''), ev);
       currentRoleTrack?.querySelectorAll('.role-node').forEach(n => { n.classList.remove('running','pending'); n.classList.add('done'); });
       setStatus('done');
       setReasoningProgress(100, 'done');
       break;
     case 'tool_blocked':
-      addPill('tool-blocked', '&#x26D4; blocked: ' + escapeHtml(ev.tool||''));
-      addPill('tool-blocked', '&#x26A0; action blocked by safety');
+      addPill('tool-blocked', '&#x26D4; blocked: ' + escapeHtml(ev.tool||''), ev);
+      addPill('tool-blocked', '&#x26A0; action blocked by safety', ev);
       break;
     case 'reasoning_trace':
-      addPill('thinking-pill', '&#x1F9E0; reasoning step ' + String(ev.step || ''));
+      addPill('thinking-pill', '&#x1F9E0; reasoning step ' + String(ev.step || ''), ev);
       bumpReasoningProgress(3, 'reasoning');
       break;
     case 'reflection':
-      addPill('thinking-pill', '&#x1F50D; reflection');
+      addPill('thinking-pill', '&#x1F50D; reflection', ev);
       bumpReasoningProgress(2, 'reflection');
       break;
     case 'provider_degraded':
-      addPill('tool-blocked', '&#x26A0; provider degraded ' + escapeHtml(ev.from || '') + ' → ' + escapeHtml(ev.to || ''));
+      addPill('tool-blocked', '&#x26A0; provider degraded ' + escapeHtml(ev.from || '') + ' → ' + escapeHtml(ev.to || ''), ev);
       bumpReasoningProgress(1, 'degraded');
       break;
     case 'reflexion_retry':
-      addPill('thinking-pill', '&#x1F504; retry attempt ' + String(ev.attempt || ''));
+      addPill('thinking-pill', '&#x1F504; retry attempt ' + String(ev.attempt || ''), ev);
       bumpReasoningProgress(2, 'retry');
       break;
     case 'workflow_tool_blocked':
-      addPill('tool-blocked', '&#x26D4; workflow blocked ' + escapeHtml(ev.tool || ''));
+      addPill('tool-blocked', '&#x26D4; workflow blocked ' + escapeHtml(ev.tool || ''), ev);
       break;
     case 'tool_declined':
-      addPill('tool-blocked', '&#x26D4; declined ' + escapeHtml(ev.tool || ''));
+      addPill('tool-blocked', '&#x26D4; declined ' + escapeHtml(ev.tool || ''), ev);
       break;
     case 'confirm_request':
-      addPill('thinking-pill', '&#x1F6E1; confirmation required: ' + escapeHtml(ev.tool || ''));
+      addPill('thinking-pill', '&#x1F6E1; confirmation required: ' + escapeHtml(ev.tool || ''), ev);
       break;
     case 'steer':
       if (currentContentDiv) {
@@ -759,10 +827,138 @@ function handleEvent(ev) {
       appendTextChunk('[Error: ' + (ev.message || ev.content || 'unknown') + ']');
       break;
     case 'stream_notice':
-      addPill('thinking-pill', '&#x2139; ' + escapeHtml(ev.message || 'streaming notice'));
+      addPill('thinking-pill', '&#x2139; ' + escapeHtml(ev.message || 'streaming notice'), ev);
       break;
   }
   if (ev.conversation_id && !currentConvId) currentConvId = ev.conversation_id;
+}
+
+// ── Pill detail panel (click to expand) ───────────────────────────────────
+function buildPillDetailHTML(ev) {
+  if (!ev) return '';
+  const rows = [];
+  const add = (label, val) => { if (val !== undefined && val !== null && val !== '') rows.push('<tr><td class="pd-label">' + escapeHtml(String(label)) + '</td><td class="pd-val">' + escapeHtml(String(val)) + '</td></tr>'); };
+  add('Event', ev.type);
+  switch (ev.type) {
+    case 'task_classified':
+      add('Task type', ev.task_type);
+      add('Complexity', ev.complexity);
+      if (Array.isArray(ev.recommended_tools) && ev.recommended_tools.length)
+        add('Recommended tools', ev.recommended_tools.join(', '));
+      add('Reason', ev.reason);
+      break;
+    case 'agent_start':
+      add('Mode', ev.mode); add('Provider', ev.provider); add('Model', ev.model);
+      break;
+    case 'mode_switched':
+      add('Mode', ev.mode); add('Previous', ev.previous); add('Reason', ev.reason);
+      break;
+    case 'routed':
+      add('Provider', ev.provider); add('Model', ev.model); add('Reason', ev.reason);
+      break;
+    case 'multiagent_start':
+      if (Array.isArray(ev.roles)) add('Roles', ev.roles.join(', '));
+      add('Strategy', ev.strategy);
+      break;
+    case 'subtask_routed':
+      add('Role', ev.role); add('Provider', ev.provider); add('Model', ev.model);
+      if (Array.isArray(ev.recommended_tools) && ev.recommended_tools.length)
+        add('Tools', ev.recommended_tools.join(', '));
+      add('Task', ev.task || ev.task_type);
+      break;
+    case 'subtask_escalated':
+      add('Role', ev.role); add('From', ev.from); add('Reason', ev.reason);
+      break;
+    case 'subtask_stuck':
+      add('Role', ev.role); add('Task type', ev.task_type); add('Reason', ev.reason);
+      break;
+    case 'subtask_done':
+      add('Role', ev.role); add('Chars', ev.chars); add('Duration', ev.duration);
+      break;
+    case 'boss_routed':
+      add('Provider', ev.provider); add('Model', ev.model);
+      break;
+    case 'boss_approved':
+      add('Score', ev.score); add('Feedback', ev.feedback);
+      break;
+    case 'boss_refinement':
+      add('Attempt', ev.attempt); add('Feedback', ev.feedback);
+      break;
+    case 'multiagent_replan':
+      add('New subtasks', ev.new_subtasks); add('Reason', ev.reason);
+      break;
+    case 'mission_iteration':
+      add('Iteration', (ev.iteration||1) + '/' + (ev.max||'?'));
+      add('Blockers', ev.blockers); add('Strategy', ev.strategy);
+      break;
+    case 'mission_adapting':
+      add('Reason', ev.reason); add('New approach', ev.new_approach || ev.approach);
+      break;
+    case 'iteration':
+      add('Iteration', ev.current || ev.iteration); add('Max', ev.max);
+      break;
+    case 'llm_call_done':
+      add('Tokens', ev.tokens); add('Duration', ev.duration_ms ? (ev.duration_ms/1000).toFixed(2) + 's' : '');
+      add('Model', ev.model); add('Provider', ev.provider);
+      add('Input tokens', ev.input_tokens); add('Output tokens', ev.output_tokens);
+      break;
+    case 'safety_check':
+      add('Verdict', ev.verdict); add('Reason', ev.reason); add('Tool', ev.tool);
+      break;
+    case 'learning':
+      add('Score', ev.score); add('Summary', ev.summary);
+      break;
+    case 'agent_done':
+      add('Iterations', ev.iterations); add('Tool calls', ev.tool_calls);
+      add('Duration', ev.duration); add('Tokens total', ev.total_tokens);
+      break;
+    case 'tool_blocked': case 'workflow_tool_blocked': case 'tool_declined':
+      add('Tool', ev.tool); add('Reason', ev.reason);
+      break;
+    case 'reasoning_trace':
+      add('Step', ev.step); add('Content', ev.content);
+      break;
+    case 'reflection':
+      add('Content', ev.content); add('Score', ev.score);
+      break;
+    case 'provider_degraded':
+      add('From', ev.from); add('To', ev.to); add('Reason', ev.reason);
+      break;
+    case 'reflexion_retry':
+      add('Attempt', ev.attempt); add('Reason', ev.reason);
+      break;
+    case 'confirm_request':
+      add('Tool', ev.tool); add('Args', ev.args ? JSON.stringify(ev.args) : '');
+      break;
+    case 'stream_notice':
+      add('Message', ev.message);
+      break;
+    default:
+      // Show all non-type keys
+      Object.keys(ev).forEach(k => { if (k !== 'type' && k !== 'event') add(k, typeof ev[k] === 'object' ? JSON.stringify(ev[k]) : ev[k]); });
+  }
+  if (!rows.length) return '<div class="pd-empty">No additional details</div>';
+  return '<table class="pill-detail-table">' + rows.join('') + '</table>';
+}
+
+function togglePillDetail(pill) {
+  const existing = pill.nextElementSibling;
+  if (existing && existing.classList.contains('pill-detail')) {
+    existing.remove();
+    pill.classList.remove('pill-expanded');
+    return;
+  }
+  // Close any other open pill-detail in the same pills container
+  const container = pill.closest('.event-pills');
+  if (container) {
+    container.querySelectorAll('.pill-detail').forEach(d => { d.previousElementSibling?.classList.remove('pill-expanded'); d.remove(); });
+  }
+  const panel = document.createElement('div');
+  panel.className = 'pill-detail';
+  panel.innerHTML = buildPillDetailHTML(pill._evData);
+  pill.classList.add('pill-expanded');
+  pill.after(panel);
+  scrollToBottom();
 }
 
 function toggleToolBadgeOverflow(btn) {
@@ -786,18 +982,189 @@ function appendUserMessage(text, fileLabels) {
   const files = (fileLabels && fileLabels.length)
     ? `<div class="user-files">${fileLabels.map(n => `<span class="user-file-chip">📎 ${escapeHtml(n)}</span>`).join('')}</div>`
     : '';
-  div.innerHTML = `<div class="msg-bubble">${files}<span>${escapeHtml(text)}</span></div>`;
+  div.innerHTML = `<div class="msg-bubble">${files}<span>${escapeHtml(text)}</span><div class="msg-actions"><button class="msg-action-btn" onclick="copyUserMessage(this)" title="Copy">📋</button><button class="msg-action-btn" onclick="retryUserMessage(this)" title="Retry">🔄</button></div></div>`;
   msgs.appendChild(div);
   scrollToBottom();
 }
 
-function appendAssistantHistory(text) {
+function appendAssistantHistory(text, events) {
   const msgs = document.getElementById('messages');
   const div = document.createElement('div');
   div.className = 'message assistant';
-  div.innerHTML = `<div class="msg-bubble"><div class="msg-text-segment">${renderMarkdown(text)}</div>
-    <div class="msg-actions"><button class="msg-action-btn" onclick="copyMessageText(this)">Copy</button></div></div>`;
+
+  // Build structure with pills container + terminal area + text
+  const hasEvents = Array.isArray(events) && events.length > 0;
+  div.innerHTML =
+    '<div class="msg-bubble">' +
+      (hasEvents ? '<div class="event-pills"></div>' : '') +
+      '<div class="msg-content"></div>' +
+      '<div class="msg-actions"><button class="msg-action-btn" onclick="copyMessageText(this)" title="Copy">📋</button></div>' +
+    '</div>';
   msgs.appendChild(div);
+
+  // Render pills and terminal widgets from stored events
+  if (hasEvents) {
+    const pillsEl = div.querySelector('.event-pills');
+    const contentEl = div.querySelector('.msg-content');
+    const addHistPill = (cls, html, evData) => {
+      if (!pillsEl) return;
+      const p = document.createElement('div');
+      p.className = 'pill ' + cls;
+      p.innerHTML = html;
+      if (evData) p._evData = evData;
+      p.style.cursor = 'pointer';
+      p.addEventListener('click', () => togglePillDetail(p));
+      pillsEl.appendChild(p);
+    };
+    const renderToolBadges = (tools) => {
+      const list = Array.isArray(tools) ? tools : [];
+      if (!list.length) return '';
+      const vis = list.slice(0, 4);
+      return ' <span class="tool-mini-badges">' + vis.map(t =>
+        '<span class="tool-mini-badge">' + escapeHtml(String(t)) + '</span>'
+      ).join('') + (list.length > 4 ? '<span class="tool-mini-badge">+' + (list.length - 4) + '</span>' : '') + '</span>';
+    };
+    // Track tool_start events to pair with tool_result
+    const pendingTools = {};
+    events.forEach(ev => {
+      if (!ev || !ev.type) return;
+      switch (ev.type) {
+        case 'task_classified':
+          addHistPill('task-classified', '&#x1F4CB; ' + escapeHtml(ev.task_type || 'task'), ev);
+          break;
+        case 'agent_start':
+          addHistPill('agent-start', '&#x25B6; agent', ev);
+          break;
+        case 'mode_switched':
+          addHistPill('thinking-pill', '&#x1F504; mode &rarr; ' + escapeHtml(ev.mode || ''), ev);
+          break;
+        case 'routed':
+          addHistPill('routed-pill', '&#x1F500; &rarr; ' + escapeHtml(ev.model || ''), ev);
+          break;
+        case 'multiagent_start':
+          addHistPill('agent-start', '&#x1F9E0; multiagent (' + String((ev.roles||[]).length) + ' roles)', ev);
+          break;
+        case 'subtask_routed': {
+          const tools = renderToolBadges(ev.recommended_tools || []);
+          addHistPill('routed-pill', '&#x1F9E9; ' + escapeHtml(ev.role||'') + ' &rarr; ' + escapeHtml(ev.provider||'') + (ev.model ? ':' + escapeHtml(ev.model) : '') + tools, ev);
+          break;
+        }
+        case 'subtask_escalated':
+          addHistPill('thinking-pill', '&#x26A0; escalated ' + escapeHtml(ev.role||''), ev);
+          break;
+        case 'subtask_stuck':
+          addHistPill('tool-blocked', '&#x26D4; stuck: ' + escapeHtml(ev.role||''), ev);
+          break;
+        case 'boss_routed':
+          addHistPill('routed-pill', '&#x1F451; boss &rarr; ' + escapeHtml(ev.provider||''), ev);
+          break;
+        case 'boss_approved':
+          addHistPill('agent-done-pill', '&#x2714; synthesis approved', ev);
+          break;
+        case 'boss_refinement':
+          addHistPill('thinking-pill', '&#x1F504; refining (attempt ' + (ev.attempt||'') + ')', ev);
+          break;
+        case 'multiagent_replan':
+          addHistPill('thinking-pill', '&#x1F501; replan (' + (ev.new_subtasks||0) + ' tasks)', ev);
+          break;
+        case 'mission_iteration':
+          addHistPill('thinking-pill', '&#x1F504; iter ' + (ev.iteration||1) + '/' + (ev.max||'?') + (ev.blockers ? ' (' + ev.blockers + ' blockers)' : ''), ev);
+          break;
+        case 'mission_adapting':
+          addHistPill('agent-done-pill', '&#x1F9E0; adapting', ev);
+          break;
+        case 'iteration':
+          addHistPill('thinking-pill', '&#x1F914; iteration ' + (ev.current || ev.iteration || ''), ev);
+          break;
+        case 'llm_call_done':
+          addHistPill('thinking-pill', '&#x26A1; ' + (ev.tokens||'') + ' tok ' + (ev.duration_ms ? (ev.duration_ms/1000).toFixed(1)+'s' : ''), ev);
+          break;
+        case 'safety_check':
+          addHistPill('safety-pill', '&#x1F6E1; safety: ' + (ev.verdict||'ok'), ev);
+          break;
+        case 'learning':
+          addHistPill('learning-pill', '&#x1F393; score: ' + (ev.score||''), ev);
+          break;
+        case 'agent_done':
+          addHistPill('agent-done-pill', '&#x2705; done' + (ev.iterations ? ' (' + ev.iterations + ' iters)' : ''), ev);
+          break;
+        case 'tool_blocked': case 'workflow_tool_blocked': case 'tool_declined':
+          addHistPill('tool-blocked', '&#x26D4; ' + escapeHtml(ev.tool||''), ev);
+          break;
+        case 'reasoning_trace':
+          addHistPill('thinking-pill', '&#x1F9E0; reasoning step ' + String(ev.step||''), ev);
+          break;
+        case 'reflection':
+          addHistPill('thinking-pill', '&#x1F50D; reflection', ev);
+          break;
+        case 'provider_degraded':
+          addHistPill('tool-blocked', '&#x26A0; degraded ' + escapeHtml(ev.from||'') + ' &rarr; ' + escapeHtml(ev.to||''), ev);
+          break;
+        case 'reflexion_retry':
+          addHistPill('thinking-pill', '&#x1F504; retry #' + String(ev.attempt||''), ev);
+          break;
+        case 'stream_notice':
+          addHistPill('thinking-pill', '&#x2139; ' + escapeHtml(ev.message||''), ev);
+          break;
+        case 'tool_start': {
+          const tid = ev.tool_id || ev.tool || Date.now();
+          const w = document.createElement('div');
+          w.className = 'tool-terminal'; w.dataset.tid = tid;
+          w.innerHTML = '<div class="tool-terminal-header" onclick="toggleTerminal(this)">' +
+            '<span class="term-status pending"></span>' +
+            '<span class="term-name">&#x1F528; ' + escapeHtml(ev.tool||'tool') + '(' + escapeHtml(JSON.stringify(ev.args||{}).slice(0,60)) + ')</span>' +
+            '<span class="term-dur"></span>' +
+            '</div>' +
+            '<div class="tool-terminal-body collapsed">' +
+            '<span class="term-line stdin">&gt; ' + escapeHtml(ev.tool||'') + ' ' + escapeHtml(JSON.stringify(ev.args||{})) + '</span>' +
+            '</div>' +
+            '<div class="tool-terminal-footer">' +
+            '<button class="sm-btn" onclick="copyTerminalOutput(this)">Copy output</button>' +
+            '</div>';
+          contentEl.appendChild(w);
+          pendingTools[tid] = w;
+          break;
+        }
+        case 'tool_result': {
+          const tid = ev.tool_id || ev.tool;
+          const w = pendingTools[tid];
+          if (!w) break;
+          const status = w.querySelector('.term-status');
+          const durEl = w.querySelector('.term-dur');
+          const body = w.querySelector('.tool-terminal-body');
+          status.classList.remove('pending', 'running');
+          const ok = ev.success !== false;
+          status.classList.add(ok ? 'done' : 'err');
+          if (ev.duration) durEl.textContent = ev.duration;
+          const out = ev.output !== undefined ? String(ev.output).slice(0, 6000) : '';
+          out.split('\n').slice(0, 50).forEach(line => {
+            const s = document.createElement('span');
+            s.className = 'term-line ' + (ok ? 'stdout' : 'stderr');
+            s.textContent = line;
+            body.appendChild(s);
+          });
+          delete pendingTools[tid];
+          break;
+        }
+      }
+    });
+  }
+
+  // Render final markdown text
+  const contentArea = div.querySelector('.msg-content');
+  if (contentArea) {
+    const seg = document.createElement('div');
+    seg.className = 'msg-text-segment';
+    seg.innerHTML = renderMarkdown(text);
+    contentArea.appendChild(seg);
+  } else {
+    // Fallback: no events, simple text-only
+    const bubble = div.querySelector('.msg-bubble');
+    const seg = document.createElement('div');
+    seg.className = 'msg-text-segment';
+    seg.innerHTML = renderMarkdown(text);
+    bubble.insertBefore(seg, bubble.querySelector('.msg-actions'));
+  }
 }
 
 function createAssistantMessage() {
@@ -810,9 +1177,10 @@ function createAssistantMessage() {
       '<div class="stream-status"><span class="stream-spinner"></span><span class="stream-status-text">connecting…</span><span class="stream-elapsed"></span></div>' +
       '<div class="reasoning-progress"><div class="reasoning-progress-fill"></div><span class="reasoning-progress-label">booting</span></div>' +
       '<div class="msg-content"></div>' +
-      '<div class="msg-actions"><button class="msg-action-btn" onclick="copyMessageText(this)">Copy</button></div>' +
+      '<div class="msg-actions"><button class="msg-action-btn" onclick="copyMessageText(this)" title="Copy">📋</button></div>' +
     '</div>';
   msgs.appendChild(div);
+  autoScrollEnabled = true;
   currentAssistantDiv = div;
   currentContentDiv = div.querySelector('.msg-content');
   currentStatusEl = div.querySelector('.stream-status');
@@ -1018,6 +1386,96 @@ function modelOpts(arr) {
   ).join('');
 }
 
+// ── Provider Cards with Enable/Disable Toggle ─────────────────────────────
+const PROVIDER_LABELS = {grok: 'Grok · xAI', copilot: 'GitHub Copilot'};
+
+async function loadProviderCards() {
+  const container = document.getElementById('provider-cards');
+  if (!container) return;
+  try {
+    const r = await fetch('/api/providers');
+    const providers = await r.json();
+    const currentProv = document.getElementById('provider-select')?.value || 'grok';
+    container.innerHTML = providers.map(p => {
+      const active = p.name === currentProv && !p.disabled;
+      const label = PROVIDER_LABELS[p.name] || p.name;
+      const checked = p.disabled ? '' : 'checked';
+      return `<div class="provider-card${active ? ' active' : ''}${p.disabled ? ' disabled' : ''}" data-provider="${p.name}">
+        <span class="prov-indicator"></span>
+        <span class="prov-name">${label}</span>
+        <label class="prov-toggle" title="${p.disabled ? 'Enable' : 'Disable'} ${label}">
+          <input type="checkbox" ${checked} onchange="toggleProviderEnabled('${p.name}', event)">
+          <span class="prov-toggle-slider"></span>
+        </label>
+      </div>`;
+    }).join('');
+
+    // Click on a provider card (not the toggle) to select it
+    container.querySelectorAll('.provider-card').forEach(card => {
+      card.addEventListener('click', (e) => {
+        // Don't select if clicking the toggle
+        if (e.target.closest('.prov-toggle')) return;
+        const prov = card.dataset.provider;
+        if (card.classList.contains('disabled')) return;
+        selectProvider(prov);
+      });
+    });
+  } catch(e) {
+    console.error('Failed to load provider cards:', e);
+  }
+}
+
+function selectProvider(prov) {
+  const sel = document.getElementById('provider-select');
+  if (sel) sel.value = prov;
+  onProviderChange();
+  // Update card highlighting
+  document.querySelectorAll('.provider-card').forEach(c => {
+    c.classList.toggle('active', c.dataset.provider === prov && !c.classList.contains('disabled'));
+  });
+  // Close provider panel as confirmation
+  collapseSettings('provider');
+}
+
+async function toggleProviderEnabled(providerName, event) {
+  event.stopPropagation();
+  const checkbox = event.target;
+  try {
+    const r = await fetch('/api/provider/toggle', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({provider: providerName})
+    });
+    const d = await r.json();
+    if (d.error) {
+      // Revert the checkbox
+      checkbox.checked = !checkbox.checked;
+      console.warn('Toggle failed:', d.error);
+      return;
+    }
+    // If we just disabled the currently selected provider, switch to the first enabled one
+    const currentProv = document.getElementById('provider-select')?.value;
+    if (!d.enabled && currentProv === providerName) {
+      // Find first enabled provider
+      const cards = document.querySelectorAll('.provider-card:not(.disabled)');
+      // After re-render one card will still be enabled; for now just pick any other
+      const allCards = document.querySelectorAll('.provider-card');
+      for (const c of allCards) {
+        if (c.dataset.provider !== providerName) {
+          selectProvider(c.dataset.provider);
+          break;
+        }
+      }
+    }
+    // Refresh the provider cards
+    await loadProviderCards();
+    loadStatus();
+  } catch(e) {
+    checkbox.checked = !checkbox.checked;
+    console.error('Failed to toggle provider:', e);
+  }
+}
+
 async function onModelChange() {
   const prov = document.getElementById('provider-select')?.value;
   const model = document.getElementById('model-select')?.value;
@@ -1025,6 +1483,8 @@ async function onModelChange() {
   try {
     await fetch('/api/model', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({provider: prov, model: model})});
   } catch(e) {}
+  // Close provider panel as confirmation
+  collapseSettings('provider');
 }
 
 async function onProviderChange() {
@@ -1059,9 +1519,9 @@ async function loadStatus() {
     const budget = d.copilot_budget || null;
     const currentProvider = d.default_provider || providerInfo.key || inferProviderKey(providerInfo.name) || document.getElementById('provider-select')?.value || 'grok';
     const currentModel = d.current_model || providerInfo.model || '';
-    const connected = typeof d.connected === 'boolean' ? d.connected : !!providerInfo.connected;
+    const connected = d.connected === true || providerInfo.connected === true;
     const dot = document.getElementById('connection-dot');
-    if (dot) { dot.className = 'connection-dot' + (connected ? ' connected' : ''); }
+    if (dot) { dot.className = 'connection-dot ' + (connected ? 'connected' : 'disconnected'); }
     // Set provider dropdown to whatever the server is using
     if (currentProvider) {
       const sel = document.getElementById('provider-select');
@@ -1085,6 +1545,10 @@ async function loadStatus() {
       }
     }
     updateCopilotBudgetCard(budget, currentProvider, currentModel);
+    // Update provider card highlighting
+    document.querySelectorAll('.provider-card').forEach(c => {
+      c.classList.toggle('active', c.dataset.provider === currentProvider && !c.classList.contains('disabled'));
+    });
     const badge = document.querySelector('.router-badge');
     const enabled = typeof d.router_enabled === 'boolean' ? d.router_enabled : !!routerInfo.enabled;
     if (badge) {
@@ -1269,8 +1733,12 @@ async function loadTools() {
     const d = await r.json();
     const list = document.getElementById('tool-list');
     const countBadge = document.getElementById('tool-count');
-    const tools = d.tools || [];
-    if (countBadge) countBadge.textContent = tools.length;
+    const tools = Array.isArray(d) ? d : (d.tools || []);
+    if (countBadge) {
+      countBadge.textContent = tools.length;
+      countBadge.classList.toggle('on', tools.length > 0);
+      countBadge.classList.toggle('off', tools.length === 0);
+    }
     if (list) list.innerHTML = tools.map(t =>
       `<div class="tool-item"><span class="tool-item-name">${escapeHtml(t.name)}</span><span class="badge">${escapeHtml(t.type||'tool')}</span></div>`
     ).join('');
@@ -1411,6 +1879,22 @@ function copyMessageText(btn) {
   const seg = bubble?.querySelector('.msg-text-segment');
   if (seg) copyToClipboard(seg.innerText);
 }
+function copyUserMessage(btn) {
+  const bubble = btn.closest('.msg-bubble');
+  const span = bubble?.querySelector(':scope > span');
+  if (span) copyToClipboard(span.innerText);
+}
+function retryUserMessage(btn) {
+  if (isStreaming) return;
+  const bubble = btn.closest('.msg-bubble');
+  const span = bubble?.querySelector(':scope > span');
+  if (!span) return;
+  const text = span.innerText.trim();
+  if (!text) return;
+  const input = document.getElementById('user-input');
+  if (input) { input.value = text; resizeTextarea(input); }
+  sendMessage();
+}
 function resizeTextarea(el) {
   el.style.height='auto';
   el.style.height = Math.min(el.scrollHeight, 200) + 'px';
@@ -1470,6 +1954,204 @@ async function restartServer() {
   pendingPowerTimer = setTimeout(resetPowerConfirmation, 3000);
 }
 
+// ── xAI Token Status ────────────────────────────────────────────────────────
+
+async function loadXaiTokenStatus() {
+  const dot = document.getElementById('xai-key-dot');
+  try {
+    const r = await fetch('/api/xai/token-status');
+    const d = await r.json();
+
+    // Key status
+    const keyEl = document.getElementById('xai-key-status');
+    if (keyEl) {
+      if (!d.key_configured) {
+        keyEl.textContent = 'Not configured';
+        keyEl.className = 'xai-value xai-warn';
+      } else if (d.key_valid) {
+        keyEl.textContent = `✓ Valid (${d.key_preview})`;
+        keyEl.className = 'xai-value xai-ok';
+      } else {
+        keyEl.textContent = d.key_error || 'Invalid';
+        keyEl.className = 'xai-value xai-err';
+      }
+    }
+
+    // Dot indicator
+    if (dot) {
+      dot.className = 'xai-key-dot' + (d.key_valid ? ' valid' : d.key_configured ? ' invalid' : '');
+    }
+
+    // Models count
+    const modelsEl = document.getElementById('xai-models-count');
+    if (modelsEl) {
+      modelsEl.textContent = d.models_available?.length ? `${d.models_available.length} available` : '—';
+      modelsEl.title = (d.models_available || []).join('\n');
+    }
+
+    // Session usage
+    const u = d.session_usage || {};
+    const setTxt = (id, val) => { const e = document.getElementById(id); if (e) e.textContent = val; };
+    setTxt('xai-requests', (u.request_count || 0).toLocaleString());
+    setTxt('xai-prompt-tokens', (u.prompt_tokens || 0).toLocaleString());
+    setTxt('xai-completion-tokens', (u.completion_tokens || 0).toLocaleString());
+    setTxt('xai-reasoning-tokens', (u.reasoning_tokens || 0).toLocaleString());
+    setTxt('xai-cached-tokens', (u.cached_tokens || 0).toLocaleString());
+    setTxt('xai-total-tokens', (u.total_tokens || 0).toLocaleString());
+    const cost = u.total_cost_usd || 0;
+    setTxt('xai-cost', cost < 0.001 && cost > 0 ? `$${cost.toFixed(6)}` : `$${cost.toFixed(4)}`);
+
+    // Rate limits
+    const rlEl = document.getElementById('xai-rate-limits');
+    const rl = d.rate_limits || {};
+    if (rlEl) {
+      const keys = Object.keys(rl);
+      if (keys.length) {
+        const rpmRemain = rl['remaining-requests'] ?? '?';
+        const rpmLimit  = rl['limit-requests'] ?? '?';
+        const tpmRemain = rl['remaining-tokens'] ?? '?';
+        const tpmLimit  = rl['limit-tokens'] ?? '?';
+        rlEl.innerHTML = `
+          <div class="xai-status-row"><span class="xai-label">RPM</span><span class="xai-value mono">${rpmRemain} / ${rpmLimit}</span></div>
+          <div class="xai-status-row"><span class="xai-label">TPM</span><span class="xai-value mono">${tpmRemain} / ${tpmLimit}</span></div>
+        `;
+      } else {
+        rlEl.innerHTML = '<span class="xai-muted">Make a request to see limits</span>';
+      }
+    }
+  } catch (e) {
+    console.error('xAI token status error:', e);
+    if (dot) dot.className = 'xai-key-dot';
+  }
+}
+
+// ── Documents / Knowledge Base ──────────────────────────────────────────────
+
+async function loadDocuments() {
+  const badge = document.getElementById('docs-badge');
+  const list = document.getElementById('doc-list');
+  const searchRow = document.getElementById('doc-search-row');
+  if (badge) badge.textContent = '…';
+  try {
+    const r = await fetch('/api/documents');
+    const d = await r.json();
+    const docs = d.documents || [];
+    if (badge) {
+      badge.textContent = String(docs.length);
+      badge.classList.toggle('on', docs.length > 0);
+      badge.classList.toggle('off', docs.length === 0);
+    }
+    if (searchRow) searchRow.style.display = docs.length > 0 ? 'flex' : 'none';
+    if (!list) return;
+    if (docs.length === 0) {
+      list.innerHTML = '<div class="doc-empty">No documents yet — upload one to build your knowledge base</div>';
+      return;
+    }
+    list.innerHTML = docs.map(doc => {
+      const ext = (doc.filename || '').split('.').pop().toLowerCase();
+      const icon = {pdf:'📕', docx:'📘', doc:'📘', txt:'📝', md:'📝', csv:'📊', json:'📋', py:'🐍', js:'📜', html:'🌐', sh:'⚙️'}[ext] || '📄';
+      const size = doc.chars > 10000 ? `${(doc.chars/1000).toFixed(0)}k chars` : `${doc.chars} chars`;
+      const date = new Date(doc.added_at * 1000).toLocaleDateString();
+      return `<div class="doc-item" data-id="${doc.id}">
+        <span class="doc-icon">${icon}</span>
+        <div class="doc-info">
+          <span class="doc-name" title="${doc.filename}">${doc.filename}</span>
+          <span class="doc-meta">${doc.chunks} chunks · ${size} · ${date}</span>
+        </div>
+        <button class="doc-del-btn" onclick="deleteDoc('${doc.id}', event)" title="Remove">✕</button>
+      </div>`;
+    }).join('');
+  } catch(e) {
+    if (badge) badge.textContent = '!';
+    console.error('Failed to load documents:', e);
+  }
+}
+
+async function uploadDocument(file) {
+  const processing = document.getElementById('doc-processing');
+  const fill = document.getElementById('doc-processing-fill');
+  const text = document.getElementById('doc-processing-text');
+  if (processing) processing.style.display = 'flex';
+  if (fill) fill.style.width = '30%';
+  if (text) text.textContent = `Processing ${file.name}...`;
+
+  const form = new FormData();
+  form.append('file', file);
+
+  try {
+    if (fill) fill.style.width = '60%';
+    const r = await fetch('/api/documents/upload', {method: 'POST', body: form});
+    const d = await r.json();
+    if (fill) fill.style.width = '100%';
+    if (d.error) {
+      if (text) { text.textContent = `❌ ${d.error}`; text.style.color = 'var(--red)'; }
+      setTimeout(() => { if (processing) processing.style.display = 'none'; if (text) text.style.color = ''; }, 3000);
+      return;
+    }
+    if (text) text.textContent = `✓ Added ${d.document.filename} (${d.document.chunks} chunks)`;
+    setTimeout(() => { if (processing) processing.style.display = 'none'; }, 2000);
+    loadDocuments();
+  } catch(e) {
+    if (text) { text.textContent = '❌ Upload failed'; text.style.color = 'var(--red)'; }
+    setTimeout(() => { if (processing) processing.style.display = 'none'; if (text) text.style.color = ''; }, 3000);
+    console.error('Upload failed:', e);
+  }
+}
+
+async function deleteDoc(docId, event) {
+  event.stopPropagation();
+  const btn = event.target;
+  if (btn.dataset.confirm !== 'true') {
+    btn.dataset.confirm = 'true';
+    btn.textContent = '⚠';
+    btn.title = 'Click again to confirm delete';
+    setTimeout(() => { btn.dataset.confirm = ''; btn.textContent = '✕'; btn.title = 'Remove'; }, 2500);
+    return;
+  }
+  try {
+    await fetch(`/api/documents/${docId}`, {method: 'DELETE'});
+    loadDocuments();
+  } catch(e) {
+    console.error('Failed to delete document:', e);
+  }
+}
+
+async function searchKB() {
+  const input = document.getElementById('doc-search-input');
+  const results = document.getElementById('doc-search-results');
+  const query = (input?.value || '').trim();
+  if (!query || !results) return;
+  results.style.display = 'flex';
+  results.innerHTML = '<div class="doc-empty">Searching...</div>';
+  try {
+    const r = await fetch('/api/documents/search', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({query, max_chunks: 5})
+    });
+    const d = await r.json();
+    const hits = d.results || [];
+    if (hits.length === 0) {
+      results.innerHTML = '<div class="doc-empty">No matches found</div>';
+      return;
+    }
+    results.innerHTML = hits.map(h =>
+      `<div class="doc-result">
+        <div class="doc-result-file">${h.filename} · chunk ${h.chunk_index}</div>
+        <div class="doc-result-text">${escapeHtml(h.text.slice(0, 200))}${h.text.length > 200 ? '…' : ''}</div>
+      </div>`
+    ).join('');
+  } catch(e) {
+    results.innerHTML = '<div class="doc-empty">Search failed</div>';
+  }
+}
+
+function escapeHtml(text) {
+  const d = document.createElement('div');
+  d.textContent = text;
+  return d.innerHTML;
+}
+
 // ── Memory panel ────────────────────────────────────────────────────────────
 let currentMemTab = 'episodes';
 let memData = null;
@@ -1482,10 +2164,15 @@ async function loadMemory() {
     memData = await r.json();
     const totalEp = memData.episodic?.count || 0;
     const totalFacts = memData.facts?.global_count || 0;
-    if (badge) badge.textContent = totalEp + 'ep · ' + totalFacts + 'f';
+    const hasMemory = totalEp > 0 || totalFacts > 0;
+    if (badge) {
+      badge.textContent = totalEp + 'ep · ' + totalFacts + 'f';
+      badge.classList.toggle('on', hasMemory);
+      badge.classList.toggle('off', !hasMemory);
+    }
     renderMemTab(currentMemTab);
   } catch(e) {
-    if (badge) badge.textContent = 'err';
+    if (badge) { badge.textContent = 'err'; badge.classList.remove('on'); badge.classList.add('off'); }
   }
 }
 

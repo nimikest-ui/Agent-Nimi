@@ -55,12 +55,13 @@ def _enqueue_stream_event(q, event_data):
 
 @chat_bp.route('/chat', methods=['POST'])
 def chat():
-    """Send a message and get a streaming response via SSE."""
+    """Send a message and get a streaming response via SSE.
+
+    Each conversation gets its own AgentNimi from the pool, so multiple
+    chats can run truly in parallel without corrupting each other.
+    """
     data = request.get_json()
     user_msg = data.get("message", "").strip()
-    # display_message is the clean text shown in the UI / saved to history.
-    # When the extension sends an enriched message (with [PAGE CONTEXT] block),
-    # it also sends the original user text here so the UI stays clean.
     display_msg = data.get("display_message", "").strip() or user_msg
     mode = data.get("mode", "agent")  # ask | agent | plan
     if not user_msg:
@@ -71,22 +72,8 @@ def chat():
 
     audit_event("chat_request", {"mode": mode, "conversation_id": conv_id or "", "session_id": session_id})
 
-    if state.agent:
-        state.agent.set_mode(mode)
-
-    # ── Cancel any in-progress agent call before starting a new one ──────────
-    # Prevents concurrent calls from corrupting shared agent.messages state.
-    if state.agent:
-        state.agent.cancel()  # no-op if not running
-    # Clear the previous session's leftover queue items
-    prev_session = state.get_active_session()
-    if prev_session and prev_session != session_id:
-        state.clear_session(prev_session)
-    state.set_active_session(session_id)
-
     # ── Create or load conversation ───────────────────────────────────────────
     if not conv_id:
-        # Brand new conversation
         conv_id = str(uuid.uuid4())
         conv_data = {
             "id": conv_id,
@@ -105,34 +92,34 @@ def chat():
             "created_at": datetime.datetime.now().isoformat(),
         }
 
-    # ── Sync agent in-memory context if conversation changed ─────────────────
-    # This is the key part: rebuild agent.messages from stored history so the
-    # agent remembers everything from this conversation, regardless of which
-    # conversation was active before.
-    if conv_id != state.current_conv_id:
-        if state.current_conv_id and conv_id != state.current_conv_id:
-            clear_engagement(state.current_conv_id)
-        state.agent.messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+    # ── Get (or create) a per-conversation agent ─────────────────────────────
+    # Cancel any previous run *on this same conversation* (e.g. user resends).
+    prev_thread = state.get_conv_thread(conv_id)
+    if prev_thread and prev_thread.is_alive():
+        state.cancel_conv(conv_id, timeout=6.0)
+
+    agent = state.get_agent(conv_id)
+    agent.set_mode(mode)
+
+    # Rebuild messages from stored history (only needed on fresh agent)
+    if len(agent.messages) <= 1:
+        agent.messages = [{"role": "system", "content": SYSTEM_PROMPT}]
         for msg in conv.get("messages", []):
-            state.agent.messages.append({"role": msg["role"], "content": msg["content"]})
+            agent.messages.append({"role": msg["role"], "content": msg["content"]})
 
     state.set_current_conv_id(conv_id)
     start_engagement(conv_id, conv.get("title", ""))
 
-    # ── Apply provider / model / key from request if specified ───────────────
+    # ── Apply provider / model from request if specified ─────────────────────
     req_provider = data.get("provider", "").strip()
     req_model = data.get("model", "").strip()
-    req_key = data.get("api_key", "").strip()
-    
+
     if req_provider:
-        # Note: API key changes are NOT accepted from the chat endpoint for security.
-        # Keys must be set via config file or a dedicated /api/providers endpoint.
         if req_model:
             state.config["providers"].setdefault(req_provider, {})["model"] = req_model
-    
     if req_provider and req_provider != state.config.get("default_provider", "grok"):
         try:
-            state.agent.switch_provider(req_provider)
+            agent.switch_provider(req_provider)
             state.config["default_provider"] = req_provider
         except Exception:
             pass
@@ -143,12 +130,11 @@ def chat():
             pname = req_provider or state.config.get("default_provider", "grok")
             state.config["providers"].setdefault(pname, {})["model"] = req_model
             try:
-                state.agent.switch_provider(pname)
+                agent.switch_provider(pname)
             except Exception:
                 pass
 
     # ── Persist user message ──────────────────────────────────────────────────
-    # Save the clean display text, not the context-enriched agent prompt.
     conv["messages"].append({
         "role": "user",
         "content": display_msg,
@@ -159,25 +145,39 @@ def chat():
 
     # ── Stream the agent response ─────────────────────────────────────────────
     q = state.get_session(session_id)
+    # Collect non-text events so they can be persisted for history replay
+    _event_log: list[dict] = []
+    _PERSIST_TYPES = frozenset({
+        'task_classified', 'agent_start', 'mode_switched', 'routed',
+        'multiagent_start', 'subtask_escalated', 'subtask_stuck',
+        'subtask_routed', 'subtask_done', 'boss_routed', 'boss_approved',
+        'boss_refinement', 'multiagent_replan', 'mission_iteration',
+        'mission_adapting', 'multiagent_done', 'iteration',
+        'llm_call_done', 'safety_check', 'tool_start', 'tool_result',
+        'learning', 'agent_done', 'tool_blocked', 'reasoning_trace',
+        'reflection', 'provider_degraded', 'reflexion_retry',
+        'workflow_tool_blocked', 'tool_declined', 'confirm_request',
+        'stream_notice',
+    })
 
     def stream_callback(event_data):
-        # Keep audit at event granularity before splitting text chunks.
         if isinstance(event_data, dict):
-            normalized_type = event_data.get("type") or event_data.get("event")
-            if normalized_type not in {"text_chunk", "chunk"}:
-                if "event" in event_data and "type" not in event_data:
-                    audit_event("stream_event", {**event_data, "type": event_data["event"]})
-                else:
-                    audit_event("stream_event", event_data)
+            normalized = dict(event_data)
+            if 'event' in normalized and 'type' not in normalized:
+                normalized['type'] = normalized['event']
+            ev_type = str(normalized.get('type') or '')
+            if ev_type in _PERSIST_TYPES:
+                _event_log.append(normalized)
+            if ev_type not in {'text_chunk', 'chunk'}:
+                audit_event('stream_event', normalized)
         _enqueue_stream_event(q, event_data)
 
     def run_agent():
         try:
             if mode == "ask":
-                # Direct LLM call — no agent loop, no tool calls
-                msgs = list(state.agent.messages) + [{"role": "user", "content": user_msg}]
+                msgs = list(agent.messages) + [{"role": "user", "content": user_msg}]
                 full = ""
-                result = state.agent.provider.chat(msgs, stream=True)
+                result = agent.provider.chat(msgs, stream=True)
                 if hasattr(result, "__iter__") and not isinstance(result, str):
                     for chunk in result:
                         _enqueue_stream_event(q, {"type": "chunk", "content": chunk})
@@ -193,21 +193,18 @@ def chat():
                     add_copilot_usage(state.config, get_copilot_multiplier(active_model))
                     save_config(state.config)
             elif mode == "plan":
-                # Agent loop with a planning prompt prefix
                 plan_prefix = (
                     "Create a detailed, numbered step-by-step plan for the following task. "
                     "For each step specify what tools, commands, or techniques to use:\n\n"
                 )
-                response = state.agent.chat(plan_prefix + user_msg, stream_callback=stream_callback)
+                response = agent.chat(plan_prefix + user_msg, stream_callback=stream_callback)
             else:
-                # Default: full agent loop — user_msg may include [PAGE CONTEXT] from extension
-                response = state.agent.chat(user_msg, stream_callback=stream_callback)
-            
-            # Persist assistant response BEFORE sending done so the web UI
-            # always sees the full conversation when it loads via the link.
+                response = agent.chat(user_msg, stream_callback=stream_callback)
+
             conv["messages"].append({
                 "role": "assistant",
                 "content": response,
+                "events": _event_log,
                 "timestamp": datetime.datetime.now().isoformat(),
             })
             conversation_service.save_conversation(conv_id, conv)
@@ -221,23 +218,20 @@ def chat():
 
     thread = threading.Thread(target=run_agent, daemon=True)
     thread.start()
+    state.set_conv_thread(conv_id, thread, session_id)
 
     def generate():
-        # Emit conversation_id immediately so the extension sidepanel can show
-        # a live link before the agent has even started processing.
         yield f"data: {json.dumps({'type': 'conversation_id', 'conversation_id': conv_id})}\n\n"
-        deadline = 600  # total max seconds to wait for completion
+        deadline = 600
         waited = 0
         while waited < deadline:
             try:
                 item = q.get(timeout=15)
                 if item is None:
                     break
-                waited = 0  # reset on activity
+                waited = 0
                 yield f"data: {json.dumps(item)}\n\n"
             except queue.Empty:
-                # Agent thread is still running — send SSE comment to keep
-                # the browser connection alive while Grok is reasoning.
                 if not thread.is_alive():
                     break
                 waited += 15
@@ -259,9 +253,23 @@ def chat():
 
 @chat_bp.route('/cancel', methods=['POST'])
 def cancel():
-    """Cancel the currently running agent operation."""
-    if state.agent:
-        state.agent.cancel()
+    """Cancel the currently running agent operation.
+
+    Accepts an optional ``conversation_id`` to cancel a specific chat.
+    Without it, cancels *all* running conversations (legacy behaviour).
+    """
+    data = request.get_json(silent=True) or {}
+    conv_id = data.get("conversation_id")
+    if conv_id:
+        state.cancel_conv(conv_id, timeout=5.0)
+    else:
+        # Legacy: cancel everything
+        if state.agent:
+            state.agent.cancel()
+        active = state.get_active_session()
+        if active:
+            state.poison_session(active)
+        state.cancel_and_wait(timeout=5.0)
     return jsonify({"ok": True})
 
 
@@ -270,19 +278,23 @@ def steer():
     """Inject a steering message into the running agent loop."""
     data = request.get_json() or {}
     session_id = data.get("session_id")
+    conv_id = data.get("conversation_id")
     message = data.get("message", "").strip()
     
-    if not session_id or not message:
-        return jsonify({"error": "session_id and message required"}), 400
+    if not message:
+        return jsonify({"error": "message required"}), 400
+
+    # Resolve agent: prefer per-conversation, fall back to global
+    agent = state.get_agent(conv_id) if conv_id else state.agent
 
     lowered = message.lower()
     if lowered in {"!ask", "!plan", "!agent"}:
         mode = lowered[1:]
-        if state.agent:
-            state.agent.request_mode_switch(mode)
+        if agent:
+            agent.request_mode_switch(mode)
         return jsonify({"ok": True, "mode_switch": mode})
     
-    if state.agent:
-        state.agent.steer(message)
+    if agent:
+        agent.steer(message)
     
     return jsonify({"ok": True})

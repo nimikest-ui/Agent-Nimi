@@ -1,5 +1,7 @@
 """
 Grok (xAI) LLM Provider
+Supports both Chat Completions API (/v1/chat/completions) and
+Responses API (/v1/responses) for multi-agent models.
 """
 import json
 import requests
@@ -11,11 +13,23 @@ from .base import LLMProvider, register_provider
 class GrokProvider(LLMProvider):
     """xAI Grok API provider (OpenAI-compatible)."""
 
+    # Session-level usage counters (survives across chat calls)
+    _session_usage = {
+        "prompt_tokens": 0,
+        "completion_tokens": 0,
+        "reasoning_tokens": 0,
+        "cached_tokens": 0,
+        "total_tokens": 0,
+        "total_cost_usd": 0.0,
+        "request_count": 0,
+    }
+
     def __init__(self, config: dict):
         super().__init__(config)
         self.base_url = config.get("base_url", "https://api.x.ai/v1")
         self.api_key = config.get("api_key", "")
         self.model = config.get("model", "grok-3")
+        self._last_rate_limit = {}   # captured from response headers
 
     def name(self) -> str:
         return f"Grok ({self.model})"
@@ -26,7 +40,16 @@ class GrokProvider(LLMProvider):
             "Content-Type": "application/json",
         }
 
+    def _is_multi_agent(self) -> bool:
+        """Check if the current model requires the Responses API (multi-agent)."""
+        return "multi-agent" in self.model
+
+    # ── Chat Completions path (standard models) ──────────────────
+
     def chat(self, messages: list[dict], stream: bool = True) -> str | Generator[str, None, None]:
+        if self._is_multi_agent():
+            return self._responses_chat(messages, stream)
+
         url = f"{self.base_url}/chat/completions"
         payload = {
             "model": self.model,
@@ -40,12 +63,76 @@ class GrokProvider(LLMProvider):
         else:
             payload["stream"] = False
             resp = requests.post(url, json=payload, headers=self._headers(), timeout=300)
+            if resp.status_code == 400:
+                detail = resp.text[:300]
+                raise RuntimeError(f"Grok API rejected the request (400): {detail}")
             resp.raise_for_status()
-            return resp.json()["choices"][0]["message"]["content"]
+            self._capture_rate_limits(resp)
+            body = resp.json()
+            self._accumulate_usage(body.get("usage"))
+            return body["choices"][0]["message"]["content"]
+
+    def _capture_rate_limits(self, resp):
+        """Capture rate-limit headers from an API response."""
+        h = resp.headers
+        rl = {}
+        for key in ("x-ratelimit-limit-requests", "x-ratelimit-remaining-requests",
+                    "x-ratelimit-limit-tokens", "x-ratelimit-remaining-tokens",
+                    "x-ratelimit-reset-requests", "x-ratelimit-reset-tokens"):
+            val = h.get(key)
+            if val is not None:
+                rl[key.replace("x-ratelimit-", "")] = val
+        if rl:
+            self._last_rate_limit = rl
+
+    def _accumulate_usage(self, usage: dict):
+        """Add a response's usage object to session counters."""
+        if not usage:
+            return
+        s = GrokProvider._session_usage
+        s["prompt_tokens"] += usage.get("prompt_tokens", 0)
+        s["completion_tokens"] += usage.get("completion_tokens", 0)
+        s["total_tokens"] += usage.get("total_tokens", 0)
+        s["request_count"] += 1
+        # Reasoning tokens from details
+        details = usage.get("completion_tokens_details", {})
+        s["reasoning_tokens"] += details.get("reasoning_tokens", 0)
+        # Cached tokens
+        prompt_details = usage.get("prompt_tokens_details", {})
+        s["cached_tokens"] += prompt_details.get("cached_tokens", 0)
+        # Cost in USD (ticks = 1/10,000,000,000 USD)
+        cost_ticks = usage.get("cost_in_usd_ticks", 0)
+        if cost_ticks:
+            s["total_cost_usd"] += cost_ticks / 10_000_000_000
+
+    def get_session_usage(self) -> dict:
+        """Return accumulated session token usage."""
+        return dict(GrokProvider._session_usage)
+
+    def get_rate_limits(self) -> dict:
+        """Return last captured rate limit headers."""
+        return dict(self._last_rate_limit)
+
+    @classmethod
+    def reset_session_usage(cls):
+        """Reset session counters."""
+        cls._session_usage = {
+            "prompt_tokens": 0,
+            "completion_tokens": 0,
+            "reasoning_tokens": 0,
+            "cached_tokens": 0,
+            "total_tokens": 0,
+            "total_cost_usd": 0.0,
+            "request_count": 0,
+        }
 
     def _stream_response(self, url: str, payload: dict) -> Generator[str, None, None]:
         with requests.post(url, json=payload, headers=self._headers(), stream=True, timeout=300) as resp:
+            if resp.status_code == 400:
+                detail = resp.text[:300]
+                raise RuntimeError(f"Grok API rejected the request (400): {detail}")
             resp.raise_for_status()
+            self._capture_rate_limits(resp)
             for line in resp.iter_lines():
                 if line:
                     line_str = line.decode("utf-8")
@@ -55,11 +142,115 @@ class GrokProvider(LLMProvider):
                             break
                         try:
                             data = json.loads(data_str)
+                            # Capture usage from the final chunk
+                            if "usage" in data:
+                                self._accumulate_usage(data["usage"])
                             delta = data.get("choices", [{}])[0].get("delta", {})
                             if "content" in delta and delta["content"]:
                                 yield delta["content"]
                         except json.JSONDecodeError:
                             continue
+
+    # ── Responses API path (multi-agent models) ──────────────────
+
+    def _responses_chat(self, messages: list[dict], stream: bool = True) -> str | Generator[str, None, None]:
+        """Use /v1/responses endpoint for multi-agent models."""
+        url = f"{self.base_url}/responses"
+
+        # Convert messages to Responses API 'input' format
+        input_msgs = []
+        for msg in messages:
+            role = msg.get("role", "user")
+            content = msg.get("content", "")
+            # Responses API uses 'developer' instead of 'system'
+            if role == "system":
+                role = "developer"
+            input_msgs.append({"role": role, "content": content})
+
+        payload = {
+            "model": self.model,
+            "input": input_msgs,
+            "stream": stream,
+        }
+
+        if stream:
+            return self._stream_responses(url, payload)
+        else:
+            payload["stream"] = False
+            resp = requests.post(url, json=payload, headers=self._headers(), timeout=600)
+            if resp.status_code == 400:
+                detail = resp.text[:300]
+                raise RuntimeError(f"Grok Responses API rejected the request (400): {detail}")
+            resp.raise_for_status()
+            self._capture_rate_limits(resp)
+            body = resp.json()
+            self._accumulate_usage(body.get("usage"))
+            return self._extract_responses_text(body)
+
+    def _extract_responses_text(self, data: dict) -> str:
+        """Extract text content from a Responses API JSON response."""
+        for item in data.get("output", []):
+            if item.get("type") == "message":
+                for block in item.get("content", []):
+                    if block.get("type") == "output_text":
+                        return block.get("text", "")
+        # Fallback: try first output item content
+        output = data.get("output", [])
+        if output and isinstance(output, list):
+            first = output[0]
+            if isinstance(first, dict):
+                content = first.get("content", [])
+                if content and isinstance(content, list):
+                    return content[0].get("text", str(content))
+        return str(data)
+
+    def _stream_responses(self, url: str, payload: dict) -> Generator[str, None, None]:
+        """Stream from /v1/responses using SSE.
+        
+        Responses API streams events like:
+          data: {"type": "response.output_text.delta", "delta": "token"}
+          data: {"type": "response.completed", ...}
+        """
+        with requests.post(url, json=payload, headers=self._headers(), stream=True, timeout=600) as resp:
+            if resp.status_code == 400:
+                detail = resp.text[:300]
+                raise RuntimeError(f"Grok Responses API rejected the request (400): {detail}")
+            resp.raise_for_status()
+            self._capture_rate_limits(resp)
+            for line in resp.iter_lines():
+                if not line:
+                    continue
+                line_str = line.decode("utf-8")
+                if not line_str.startswith("data: "):
+                    continue
+                data_str = line_str[6:]
+                if data_str.strip() == "[DONE]":
+                    break
+                try:
+                    event = json.loads(data_str)
+                except json.JSONDecodeError:
+                    continue
+                etype = event.get("type", "")
+                # Text delta tokens
+                if etype == "response.output_text.delta":
+                    delta = event.get("delta", "")
+                    if delta:
+                        yield delta
+                # Also handle content_part delta (alternate format)
+                elif etype == "response.content_part.delta":
+                    delta = event.get("delta", {})
+                    if isinstance(delta, dict):
+                        text = delta.get("text", "")
+                        if text:
+                            yield text
+                    elif isinstance(delta, str) and delta:
+                        yield delta
+                # Capture usage from completed event
+                elif etype in ("response.completed", "response.done"):
+                    resp_data = event.get("response", event)
+                    if "usage" in resp_data:
+                        self._accumulate_usage(resp_data["usage"])
+                    break
 
     def chat_vision(
         self,

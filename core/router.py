@@ -320,8 +320,14 @@ class SmartRouter:
 
     # ─── Internals ───
 
+    def _is_disabled(self, provider_name: str) -> bool:
+        """Check if a provider has been disabled by the user."""
+        return provider_name in self.config.get("disabled_providers", [])
+
     def _make_provider(self, provider_name: str, model: str, task_type: str | None = None) -> LLMProvider | None:
         """Create a provider instance with a specific model override."""
+        if self._is_disabled(provider_name):
+            return None
         pconf = self.config.get("providers", {}).get(provider_name)
         if not pconf:
             return None
@@ -338,6 +344,8 @@ class SmartRouter:
 
     def _try_provider(self, provider_name: str, task_type: str | None = None) -> LLMProvider | None:
         """Try to create a provider with its configured model and test connection."""
+        if self._is_disabled(provider_name):
+            return None
         pconf = self.config.get("providers", {}).get(provider_name)
         if not pconf:
             return None

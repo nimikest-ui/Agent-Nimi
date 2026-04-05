@@ -11,6 +11,7 @@ CONFIG_FILE = CONFIG_DIR / "config.json"
 
 DEFAULT_CONFIG = {
     "default_provider": "grok",
+    "disabled_providers": [],
     "providers": {
         "grok": {
             "base_url": "https://api.x.ai/v1",

@@ -304,12 +304,13 @@ def extension_chat():
     state.set_extension_conversation(tab_key, conv_id)
 
     # Rebuild agent context from the selected conversation.
-    state.agent.messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+    agent = state.get_agent(conv_id)
+    agent.messages = [{"role": "system", "content": SYSTEM_PROMPT}]
     for msg in conv_data.get("messages", []):
         role = str(msg.get("role", "")).strip()
         content = str(msg.get("content", ""))
         if role in {"user", "assistant"} and content:
-            state.agent.messages.append({"role": role, "content": content})
+            agent.messages.append({"role": role, "content": content})
     state.set_current_conv_id(conv_id)
     start_engagement(conv_id, conv_data.get("title", ""))
 
@@ -322,20 +323,37 @@ def extension_chat():
     conversation_service.save_conversation(conv_id, conv_data)
 
     q = state.get_session(session_id)
+    # Collect events for history replay (same as main chat)
+    _ext_event_log: list[dict] = []
+    _EXT_PERSIST_TYPES = frozenset({
+        'task_classified', 'agent_start', 'mode_switched', 'routed',
+        'multiagent_start', 'subtask_routed', 'subtask_done',
+        'boss_routed', 'boss_approved', 'iteration', 'llm_call_done',
+        'safety_check', 'tool_start', 'tool_result', 'learning',
+        'agent_done', 'tool_blocked', 'stream_notice', 'mission_iteration',
+    })
 
     def stream_callback(event_data):
+        if isinstance(event_data, dict):
+            normalized = dict(event_data)
+            if 'event' in normalized and 'type' not in normalized:
+                normalized['type'] = normalized['event']
+            ev_type = str(normalized.get('type') or '')
+            if ev_type in _EXT_PERSIST_TYPES:
+                _ext_event_log.append(normalized)
         _enqueue_stream_event(q, event_data)
 
     def run_agent():
         try:
             # Full agent loop — nmap, shell, subdomains, all tools available
-            response = state.agent.chat(full_msg, stream_callback=stream_callback)
+            response = agent.chat(full_msg, stream_callback=stream_callback)
 
             # Persist assistant response BEFORE sending done so the web UI
             # always sees the full conversation when it loads via the extension link.
             conv_data["messages"].append({
                 "role": "assistant",
                 "content": response,
+                "events": _ext_event_log,
                 "timestamp": datetime.datetime.now().isoformat(),
             })
             conversation_service.save_conversation(conv_id, conv_data)
@@ -349,6 +367,7 @@ def extension_chat():
 
     thread = threading.Thread(target=run_agent, daemon=True)
     thread.start()
+    state.set_conv_thread(conv_id, thread, session_id)
 
     def generate():
         # Immediately emit conversation_id so the side panel can show a link

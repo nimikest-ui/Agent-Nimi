@@ -47,11 +47,18 @@ def init_agent(provider_name: str = None):
 
 
 def switch_provider(provider_name: str):
-    """Switch to a different provider."""
+    """Switch to a different provider (applies to the default agent + all pool agents)."""
     if state.agent:
         state.agent.switch_provider(provider_name)
-        state.config["default_provider"] = provider_name
-        save_config(state.config)
+    # Also switch any pooled agents
+    with state._pool_lock:
+        for ag in state._agents.values():
+            try:
+                ag.switch_provider(provider_name)
+            except Exception:
+                pass
+    state.config["default_provider"] = provider_name
+    save_config(state.config)
     return state.agent
 
 

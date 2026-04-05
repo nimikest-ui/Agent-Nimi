@@ -13,6 +13,7 @@ providers_bp = Blueprint('providers', __name__, url_prefix='/api')
 @providers_bp.route('/providers')
 def get_providers():
     """List available providers with their configuration."""
+    disabled = state.config.get("disabled_providers", [])
     result = []
     for pname in list_providers():
         pconf = state.config.get("providers", {}).get(pname, {})
@@ -21,8 +22,36 @@ def get_providers():
             "model": pconf.get("model", ""),
             "has_key": bool(pconf.get("api_key")) if pname != "copilot" else None,
             "is_current": state.agent and pname in state.agent.provider.name().lower(),
+            "disabled": pname in disabled,
         })
     return jsonify(result)
+
+
+@providers_bp.route('/provider/toggle', methods=['POST'])
+def toggle_provider():
+    """Enable or disable a provider."""
+    data = request.get_json() or {}
+    provider = data.get("provider", "").strip()
+    if not provider:
+        return jsonify({"error": "Provider name required"}), 400
+    if provider not in list_providers():
+        return jsonify({"error": f"Unknown provider: {provider}"}), 400
+
+    disabled = state.config.setdefault("disabled_providers", [])
+    if provider in disabled:
+        disabled.remove(provider)
+        enabled = True
+    else:
+        # Don't allow disabling the last enabled provider
+        all_providers = list_providers()
+        still_enabled = [p for p in all_providers if p not in disabled and p != provider]
+        if not still_enabled:
+            return jsonify({"error": "Cannot disable all providers — at least one must remain enabled"}), 400
+        disabled.append(provider)
+        enabled = False
+
+    save_config(state.config)
+    return jsonify({"success": True, "provider": provider, "enabled": enabled})
 
 
 @providers_bp.route('/provider', methods=['POST'])
@@ -149,3 +178,60 @@ def provider_health():
     deep = request.args.get("deep", "true").lower() in ("true", "1", "yes")
     results = check_all_providers(state.config or {}, deep=deep)
     return jsonify(results)
+
+
+@providers_bp.route('/xai/token-status')
+def xai_token_status():
+    """Get xAI API key status, session usage, and rate limits."""
+    import requests as _req
+
+    grok_conf = (state.config or {}).get("providers", {}).get("grok", {})
+    api_key = grok_conf.get("api_key", "")
+    base_url = grok_conf.get("base_url", "https://api.x.ai/v1")
+
+    result = {
+        "key_configured": bool(api_key),
+        "key_valid": False,
+        "key_preview": f"...{api_key[-6:]}" if len(api_key) > 6 else ("***" if api_key else ""),
+        "models_available": [],
+        "rate_limits": {},
+        "session_usage": {},
+    }
+
+    if not api_key:
+        return jsonify(result)
+
+    # 1) Validate key & list available models
+    try:
+        resp = _req.get(
+            f"{base_url}/models",
+            headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+            timeout=10,
+        )
+        if resp.status_code == 200:
+            result["key_valid"] = True
+            models_data = resp.json().get("data", [])
+            result["models_available"] = sorted([m.get("id", "") for m in models_data if m.get("id")])
+        elif resp.status_code == 401:
+            result["key_error"] = "Invalid or expired API key"
+        elif resp.status_code == 429:
+            result["key_valid"] = True  # key is valid, just rate-limited
+            result["key_error"] = "Rate limited"
+        else:
+            result["key_error"] = f"HTTP {resp.status_code}"
+    except _req.ConnectionError:
+        result["key_error"] = "Cannot reach api.x.ai"
+    except _req.Timeout:
+        result["key_error"] = "Request timed out"
+    except Exception as e:
+        result["key_error"] = str(e)[:100]
+
+    # 2) Session usage from the Grok provider instance
+    if state.agent and hasattr(state.agent, 'provider'):
+        prov = state.agent.provider
+        if hasattr(prov, 'get_session_usage'):
+            result["session_usage"] = prov.get_session_usage()
+        if hasattr(prov, 'get_rate_limits'):
+            result["rate_limits"] = prov.get_rate_limits()
+
+    return jsonify(result)
