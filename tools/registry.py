@@ -262,5 +262,3 @@ def _extract_balanced_json(text: str, start: int) -> str | None:
             if depth == 0:
                 return text[start:i + 1]
     return None
-
-    return None

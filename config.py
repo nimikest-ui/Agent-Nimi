@@ -1,10 +1,16 @@
+"""Kali Agent Configuration.
+
+Handles loading, saving, and migrating the user configuration stored
+at ``~/.agent-nimi/config.json``.  Also defines the default config
+values and the system prompt injected into every LLM conversation.
 """
-Kali Agent Configuration
-"""
-import os
+from __future__ import annotations
+
 import json
 import datetime
+import os
 from pathlib import Path
+from typing import Any
 
 CONFIG_DIR = Path.home() / ".agent-nimi"
 CONFIG_FILE = CONFIG_DIR / "config.json"
@@ -263,7 +269,7 @@ Rules:
 """
 
 
-def load_config() -> dict:
+def load_config() -> dict[str, Any]:
     """Load config from file, creating defaults if needed."""
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
     if CONFIG_FILE.exists():
@@ -303,9 +309,8 @@ def load_config() -> dict:
         return DEFAULT_CONFIG.copy()
 
 
-def save_config(config: dict):
+def save_config(config: dict[str, Any]) -> None:
     """Save config to file atomically (write to temp, then rename)."""
-    import os
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
     tmp_path = CONFIG_FILE.with_suffix(".tmp")
     with open(tmp_path, "w") as f:
@@ -318,7 +323,7 @@ def current_billing_period() -> str:
     return datetime.datetime.now(datetime.UTC).strftime("%Y-%m")
 
 
-def get_copilot_budget(config: dict) -> dict:
+def get_copilot_budget(config: dict[str, Any]) -> dict[str, Any]:
     """Return Copilot budget config with monthly usage reset applied."""
     budget = _deep_merge(DEFAULT_CONFIG["copilot_budget"], config.get("copilot_budget", {}))
     usage = budget.setdefault("usage", {})
@@ -330,7 +335,7 @@ def get_copilot_budget(config: dict) -> dict:
     return budget
 
 
-def add_copilot_usage(config: dict, premium_requests: float) -> dict:
+def add_copilot_usage(config: dict[str, Any], premium_requests: float) -> dict[str, Any]:
     """Increment Copilot premium-request usage for the current month."""
     budget = get_copilot_budget(config)
     usage = budget.setdefault("usage", {})
@@ -340,7 +345,7 @@ def add_copilot_usage(config: dict, premium_requests: float) -> dict:
     return budget
 
 
-def get_copilot_remaining(config: dict) -> float:
+def get_copilot_remaining(config: dict[str, Any]) -> float:
     """Return remaining Copilot premium requests for the current month."""
     budget = get_copilot_budget(config)
     total = float(budget.get("monthly_premium_requests", 0.0))
@@ -348,7 +353,7 @@ def get_copilot_remaining(config: dict) -> float:
     return round(max(0.0, total - used), 2)
 
 
-def _deep_merge(base: dict, override: dict) -> dict:
+def _deep_merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
     """Deep merge two dicts, override takes precedence."""
     result = base.copy()
     for key, value in override.items():
