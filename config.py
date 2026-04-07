@@ -103,7 +103,7 @@ DEFAULT_CONFIG = {
         "force_single_agent": False,
         "max_subtasks": 5,
         "max_replans": 3,
-        "roles": ["planner", "researcher", "executor", "critic", "memory_curator"],
+        "roles": ["planner", "researcher", "deep_researcher", "executor", "coder", "memory_curator"],
         "escalation_chain": ["grok", "copilot"],
     },
     "reflexion": {
