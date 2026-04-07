@@ -363,8 +363,15 @@ class SmartRouter:
         return None
 
     def _resolve_provider_model(self, provider_name: str, model: str, task_type: str | None = None) -> str:
-        """Select the effective model for a provider, applying Copilot quota policy."""
+        """Select the effective model for a provider, applying Copilot quota policy.
+
+        If the user has explicitly set a model (non-empty), that choice is always
+        respected.  Budget-based auto-selection only kicks in when no model is set.
+        """
         if provider_name == "copilot":
+            if model:
+                # User explicitly selected a model — honour it.
+                return model
             return self._select_copilot_model(task_type)
         return model
 

@@ -11,7 +11,6 @@ CONFIG_FILE = CONFIG_DIR / "config.json"
 
 DEFAULT_CONFIG = {
     "default_provider": "grok",
-    "disabled_providers": [],
     "providers": {
         "grok": {
             "base_url": "https://api.x.ai/v1",
@@ -23,11 +22,6 @@ DEFAULT_CONFIG = {
             "model": "claude-sonnet-4.5",
             "base_url": "https://models.github.ai",
         },
-    },
-    "safety": {
-        "confirm_destructive": False,
-        "log_all_commands": True,
-        "blocked_commands": [],
     },
     "logging": {
         "enabled": True,
@@ -90,8 +84,19 @@ DEFAULT_CONFIG = {
     },
     "safety": {
         "confirm_destructive": False,
+        "log_all_commands": True,
+        "blocked_commands": [],
         "confirm_threshold": "irreversible",
         "confirm_timeout": 60,
+        # Network disconnect failsafe (Phase-safe)
+        # When True, commands that would cut network access are blocked unless
+        # the user explicitly confirms via the confirm_destructive flow.
+        "block_network_disconnect": True,
+        # When True, a background watchdog thread monitors internet reachability
+        # and auto-restores the default interface if connectivity is lost.
+        "network_watchdog": True,
+        "network_watchdog_interval": 30,   # seconds between checks
+        "network_watchdog_hosts": ["1.1.1.1", "8.8.8.8"],  # ping targets
     },
     "multiagent": {
         "enabled_in_agent_mode": True,
@@ -140,25 +145,27 @@ DEFAULT_CONFIG = {
         "learning_coach": True,
         "max_context_chars": 8000,
     },
+    # ── OSINT (Phase 14) ──────────────────────────────────────────────
     "osint": {
-        # Enable OSINT tools (web_search, cve_lookup, github_search, shodan_host, whois_lookup).
-        "enabled": True,
-        # Shodan API key – leave empty to skip Shodan lookups.
+        # Optional: Shodan API key for host intelligence queries.
+        # Free key at https://account.shodan.io/
         "shodan_api_key": "",
-        # GitHub personal access token – optional, raises rate limit from 10→30 req/min.
+        # Optional: GitHub personal access token for higher rate limits.
         "github_token": "",
-        # Auto-enrich: automatically run CVE/WHOIS lookups during recon workflows.
-        "auto_enrich": True,
     },
+    # ── Vision (Phase 11) ───────────────────────────────────────────────
     "vision": {
-        # Enable screenshot → LLM vision analysis in the browser loop.
+        # Enable automatic LLM vision analysis of browser_screenshot outputs.
         "enabled": True,
-        # Vision model (must support image input). Grok vision is default.
-        "model": "grok-2-vision-1212",
-        # Automatically describe screenshots returned by browser_screenshot.
-        "auto_describe_screenshots": True,
-        # Max image dimension (pixels) before downscaling to save tokens.
-        "max_image_dim": 1024,
+        # Grok model to use for vision (must be a vision-capable model).
+        "grok_vision_model": "grok-2-vision-1212",
+    },
+    # ── Validation (Phase 13) ──────────────────────────────────────────
+    "validation": {
+        # Enable exploit validation in multiagent runs.
+        "enabled": True,
+        # Minimum confidence score (0.0–1.0) required to annotate as CONFIRMED.
+        "confirm_threshold": 0.5,
     },
 }
 
@@ -225,21 +232,6 @@ Available tools:
 - **remember_fact**: Args: `subject`, `predicate`, `value`, `confidence`
 - **recall_facts**: Args: `subject`, `limit`
 
-## OSINT (Open Source Intelligence)
-- **web_search**: Search the internet via DuckDuckGo. Args: `query` (str), `max_results` (int, default 10)
-- **cve_lookup**: Look up a CVE by ID from NVD. Args: `cve_id` (str, e.g. "CVE-2021-44228")
-- **github_search**: Search GitHub repositories/code. Args: `query` (str), `search_type` (repositories|code|issues), `max_results` (int)
-- **shodan_host**: Query Shodan for host info. Args: `ip` (str). Requires API key in config.
-- **whois_lookup**: WHOIS lookup on a domain or IP. Args: `target` (str)
-
-## Browser
-- **browser_navigate**: Navigate to a URL. Args: `url` (str)
-- **browser_screenshot**: Take a screenshot of the current page. No args. Returns base64 image.
-- **browser_click**: Click an element. Args: `selector` (str)
-- **browser_type**: Type text into an element. Args: `selector` (str), `text` (str)
-- **browser_annotate**: Overlay numbered red markers (Set-of-Marks) on all interactive elements. Returns element map with selectors and coordinates. Call before browser_screenshot for labeled analysis.
-- **browser_clear_marks**: Remove Set-of-Marks overlays.
-
 ## Custom Tools
 - **create_tool**: Args: `name`, `description`, `args_json`, `code`
 - **delete_tool**: Args: `name`
@@ -251,6 +243,23 @@ EXECUTION RULES:
 - If a tool fails, try alternatives silently.
 - Tool call = ONLY JSON, nothing else.
 - Done with tools = normal text (short).
+
+## Tool Creativity Rules (follow these strictly)
+
+You have access to 130+ Kali Linux tools, a full Python interpreter, bash, and the internet.
+You are NOT limited to nmap, gobuster, and nikto.
+
+Rules:
+1. If you have called the same tool twice with similar arguments, you MUST try something different next.
+2. Before repeating a tool, ask yourself: can I write a 10-line Python script that solves this faster?
+3. If a tool gives no useful output, do not run it again. Search online for a different approach:
+   - shell_exec(command="curl 'https://exploit-db.com/search?q=TARGET'")
+   - shell_exec(command="curl 'https://cve.circl.lu/api/search/KEYWORD'")
+   - shell_exec(command="searchsploit KEYWORD")
+   - shell_exec(command="wget -qO- URL") to read documentation pages
+4. Use shell_exec to write and run custom scripts when standard tools are insufficient.
+5. Chaining tools is better than repeating one tool: nmap → parse output with python → targeted nikto → custom curl.
+6. If you are stuck, STOP and think: what would a senior pentester do that a script kiddie wouldn't?
 """
 
 
@@ -285,7 +294,7 @@ def load_config() -> dict:
             cleaned_chain = [p for p in current_chain if p in {"grok", "copilot"}]
             if cleaned_chain != current_chain:
                 merged.setdefault("multiagent", {})["escalation_chain"] = cleaned_chain or ["grok", "copilot"]
-            changed = True
+                changed = True
         if changed:
             save_config(merged)
         return merged
@@ -295,10 +304,13 @@ def load_config() -> dict:
 
 
 def save_config(config: dict):
-    """Save config to file."""
+    """Save config to file atomically (write to temp, then rename)."""
+    import os
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-    with open(CONFIG_FILE, "w") as f:
+    tmp_path = CONFIG_FILE.with_suffix(".tmp")
+    with open(tmp_path, "w") as f:
         json.dump(config, f, indent=2)
+    os.replace(tmp_path, CONFIG_FILE)
 
 
 def current_billing_period() -> str:

@@ -227,6 +227,24 @@ body{display:flex;height:100vh;}
 .role-node.done{border-color:var(--green);color:var(--green);}
 .role-node.done::before{content:'✓';margin-right:2px;font-size:9px;}
 .role-node.err{border-color:var(--red);color:var(--red);}
+/* Mission todo widget */
+.todo-widget{background:var(--surface);border:1px solid var(--border2);border-radius:var(--radius-sm);padding:8px 12px;margin:6px 0;font-size:12px;font-family:var(--mono);}
+.todo-heading{font-size:11px;font-weight:700;color:var(--text3);text-transform:uppercase;letter-spacing:.04em;margin-bottom:5px;}
+.todo-widget ul{list-style:none;padding:0;margin:0;display:flex;flex-direction:column;gap:3px;}
+.todo-item{display:flex;align-items:center;gap:7px;padding:2px 0;}
+.todo-icon{font-size:11px;width:14px;text-align:center;flex-shrink:0;}
+.todo-desc{color:var(--text2);flex:1;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
+.todo-role{font-size:10px;color:var(--text3);background:var(--surface2);border:1px solid var(--border);border-radius:999px;padding:1px 6px;flex-shrink:0;}
+.todo-item.pending .todo-icon{color:var(--text3);}
+.todo-item.running .todo-icon{color:var(--cyan);animation:pulse .9s infinite;}
+.todo-item.running .todo-desc{color:var(--cyan);}
+.todo-item.done .todo-icon{color:var(--green);}
+.todo-item.done .todo-desc{color:var(--text3);text-decoration:line-through;}
+.todo-item.failed .todo-icon{color:var(--red);}
+.todo-item.failed .todo-desc{color:var(--red);}
+.todo-replan-notice{font-size:10px;color:var(--yellow);margin-bottom:5px;padding:2px 4px;border-left:2px solid var(--yellow);}
+@keyframes todoFlash{0%,100%{opacity:1} 50%{opacity:.3}}
+.todo-replace-flash{animation:todoFlash .4s ease;}
 .tool-mini-badges{display:inline-flex;align-items:center;gap:4px;margin-left:4px;}
 .tool-mini-badge{display:inline-flex;align-items:center;font-size:10px;padding:2px 7px;border-radius:999px;background:rgba(108,99,255,.1);border:1px solid rgba(108,99,255,.2);color:var(--accent2);}
 .tool-mini-more{display:inline-flex;align-items:center;justify-content:center;font-size:10px;padding:1px 6px;border-radius:999px;background:var(--surface2);border:1px solid var(--border2);color:var(--text2);cursor:pointer;font-family:var(--mono);}

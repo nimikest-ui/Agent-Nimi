@@ -707,6 +707,74 @@ function handleEvent(ev) {
       setStatus('replanning…');
       bumpReasoningProgress(2, 'replanning');
       break;
+    case 'todo_list': {
+      // Render mission todo widget inside current assistant bubble
+      if (currentBubble && Array.isArray(ev.tasks)) {
+        const widget = document.createElement('div');
+        widget.className = 'todo-widget';
+        widget.id = 'active-todo-widget';
+        const heading = document.createElement('div');
+        heading.className = 'todo-heading';
+        heading.textContent = '\uD83D\uDCCB Mission Todo';
+        widget.appendChild(heading);
+        const ul = document.createElement('ul');
+        ev.tasks.forEach(task => {
+          const li = document.createElement('li');
+          li.className = 'todo-item pending';
+          li.dataset.taskId = task.id;
+          li.innerHTML = '<span class="todo-icon">\u25CB</span><span class="todo-desc">' + escapeHtml(task.description || task.id) + '</span>'
+            + (task.role ? '<span class="todo-role">[' + escapeHtml(task.role) + ']</span>' : '');
+          ul.appendChild(li);
+        });
+        widget.appendChild(ul);
+        currentBubble.appendChild(widget);
+      }
+      break;
+    }
+    case 'todo_update': {
+      // Flip status of a task item by id
+      const iconMap = { pending: '\u25CB', running: '\u25B6', done: '\u2713', failed: '\u2717' };
+      const widget = document.getElementById('active-todo-widget');
+      if (widget && ev.id) {
+        const li = widget.querySelector('[data-task-id="' + CSS.escape(String(ev.id)) + '"]');
+        if (li) {
+          li.className = 'todo-item ' + (ev.status || 'pending');
+          const icon = li.querySelector('.todo-icon');
+          if (icon) icon.textContent = iconMap[ev.status] || '\u25CB';
+        }
+      }
+      break;
+    }
+    case 'todo_replace': {
+      // Wipe and redraw todo with flash animation
+      const oldWidget = document.getElementById('active-todo-widget');
+      if (oldWidget) {
+        oldWidget.classList.add('todo-replace-flash');
+        setTimeout(() => {
+          oldWidget.classList.remove('todo-replace-flash');
+          const ul = oldWidget.querySelector('ul');
+          if (ul) ul.innerHTML = '';
+          if (Array.isArray(ev.tasks) && ul) {
+            ev.tasks.forEach(task => {
+              const li = document.createElement('li');
+              li.className = 'todo-item pending';
+              li.dataset.taskId = task.id;
+              li.innerHTML = '<span class="todo-icon">\u25CB</span><span class="todo-desc">' + escapeHtml(task.description || task.id) + '</span>'
+                + (task.role ? '<span class="todo-role">[' + escapeHtml(task.role) + ']</span>' : '');
+              ul.appendChild(li);
+            });
+          }
+          if (ev.reason) {
+            const notice = oldWidget.querySelector('.todo-replan-notice') || document.createElement('div');
+            notice.className = 'todo-replan-notice';
+            notice.textContent = '\u21BB ' + ev.reason;
+            if (!oldWidget.querySelector('.todo-replan-notice')) oldWidget.insertBefore(notice, oldWidget.querySelector('ul'));
+          }
+        }, 400);
+      }
+      addPill('thinking-pill', '&#x21BB; replanned: ' + escapeHtml(ev.reason || 'new approach'), ev);
+      break;
+    }
     case 'mission_iteration':
       addPill('thinking-pill', '&#x1F504; mission iter ' + (ev.iteration||1) + '/' + (ev.max||'?') + (ev.blockers ? ' (' + ev.blockers + ' blockers)' : ''), ev);
       setStatus('mission iteration ' + (ev.iteration||1) + '…');

@@ -21,9 +21,10 @@ from core.episodic_memory import EpisodicMemory
 from core.fact_memory import FactMemory
 from core.world_state import WorldState
 from core.strategy_memory import StrategyMemory
+from core.mixins import ModeControlMixin, SafetyMixin, MemoryMixin, OrchestrationMixin
 
 
-class AgentNimi:
+class AgentNimi(ModeControlMixin, SafetyMixin, MemoryMixin, OrchestrationMixin):
     """Main agent class - manages conversation, LLM calls, and tool execution."""
 
     def __init__(self, provider_name: str = None, config: dict = None):
@@ -75,50 +76,8 @@ class AgentNimi:
         # ── Network watchdog (disconnect failsafe) ────────────────────────
         start_network_watchdog(self.config)
 
-    def steer(self, message: str):
-        """Inject a steering message into the running agent loop."""
-        self._steer_queue.put(message)
-
-    def set_mode(self, mode: str):
-        """Set current execution mode."""
-        if mode not in {"ask", "plan", "agent"}:
-            return
-        if mode != self._current_mode:
-            audit_event("mode_set", {"from": self._current_mode, "to": mode})
-        self._current_mode = mode
-
-    def request_mode_switch(self, mode: str):
-        """Queue a live mode switch request that can interrupt active workflows."""
-        audit_event("mode_switch_requested", {"to": mode})
-        self._mode_switch_queue.put(mode)
-
-    @property
-    def current_mode(self) -> str:
-        return self._current_mode
-
-    def consume_mode_switches(self, stream_callback=None):
-        """Apply any queued mode switch requests and emit SSE-friendly events."""
-        while True:
-            try:
-                requested = self._mode_switch_queue.get_nowait()
-                if requested not in {"ask", "plan", "agent"}:
-                    continue
-                if requested != self._current_mode:
-                    audit_event("mode_switched", {"from": self._current_mode, "to": requested})
-                    self._current_mode = requested
-                    if stream_callback:
-                        stream_callback({"event": "mode_switched", "mode": requested})
-            except queue.Empty:
-                break
-
-    def should_interrupt(self, stream_callback=None) -> tuple[bool, str]:
-        """Return interrupt state for long-running orchestration calls."""
-        self.consume_mode_switches(stream_callback)
-        if self._cancelled:
-            return True, "cancelled"
-        if self._current_mode != "agent":
-            return True, f"mode:{self._current_mode}"
-        return False, ""
+        # Active todo list — populated by run_mission at decomposition time
+        self._active_todo: list[dict] = []
 
     def chat(self, user_input: str, stream_callback=None) -> str:
         """Process user input through the agent loop.
@@ -148,20 +107,9 @@ class AgentNimi:
         # Global facts are NOT auto-injected — the agent uses recall_facts tool
         # explicitly when needed.  Auto-injecting all stored facts causes stale
         # data from past engagements to bleed into unrelated conversations.
-
-        # ── Inject knowledge base context (uploaded documents) ────────────────
-        kb_context = ""
-        try:
-            from core.knowledge_base import get_context_for_prompt
-            kb_context = get_context_for_prompt(user_input, max_chars=3000)
-        except Exception:
-            pass  # KB unavailable — no-op
-
-        # Merge episodic + KB into a single system message to avoid consecutive
-        # system-role messages which some LLM APIs reject (especially reasoning models).
-        context_parts = [p for p in (episodic_context, kb_context) if p]
-        if context_parts:
-            self.messages.append({"role": "system", "content": "\n\n".join(context_parts)})
+        if episodic_context:
+            # Use system role to avoid consecutive user messages (rejected by most LLM APIs)
+            self.messages.append({"role": "system", "content": episodic_context})
 
         self.messages.append({"role": "user", "content": user_input})
 
@@ -348,36 +296,11 @@ class AgentNimi:
                 pass
 
         # ── Store episode in episodic memory ──────────────────────────────────
-        try:
-            tools_used = list({e["tool"] for e in self.command_log[-20:]})
-            strategy = "reflexion_retry" if retry_ran else "direct"
-            self.episodic_memory.store_from_interaction(
-                user_input=user_input,
-                response=response,
-                task_type=_final_task_type,
-                provider_model=f"{self.provider.name()}:{getattr(self.provider, 'model', '')}",
-                quality_score=_final_quality,
-                tools_used=tools_used,
-                strategy=strategy,
-                issues=_final_issues,
-            )
-        except Exception:
-            pass  # never let memory storage crash the agent
-
-        # ── Record strategy outcome (Phase 10.2) ─────────────────────────────
-        try:
-            tools_used_strat = list({e["tool"] for e in self.command_log[-20:]})
-            strat_name = "reflexion_retry" if retry_ran else "direct"
-            self.strategy_memory.record(
-                task_type=_final_task_type,
-                strategy=strat_name,
-                tools_used=tools_used_strat,
-                quality=_final_quality,
-            )
-        except Exception:
-            pass
-
-        # ── Working memory management ─────────────────────────────────────────
+        tools_used = list({e["tool"] for e in self.command_log[-20:]})
+        strategy = "reflexion_retry" if retry_ran else "direct"
+        self._store_episode(user_input, response, _final_task_type, _final_quality,
+                            tools_used, strategy, _final_issues)
+        self._record_strategy(_final_task_type, strategy, tools_used, _final_quality)
         self._manage_context_window()
 
         return response
@@ -843,6 +766,17 @@ class AgentNimi:
         consecutive_unknown_tools = 0  # Counter for unrecognized tool calls
         consecutive_tool_failures = 0  # Counter for failed tool executions
 
+        # ── Inject active mission todo into context (if any) ──────────────
+        if self._active_todo:
+            icon_map = {"pending": "○", "running": "▶", "done": "✓", "failed": "✗"}
+            todo_lines = ["[MISSION TODO — current progress]"]
+            for t in self._active_todo:
+                status = t.get("status", "pending")
+                icon = icon_map.get(status, "○")
+                role_badge = f" [{t['role']}]" if t.get("role") else ""
+                todo_lines.append(f"  {icon} {t.get('description', t.get('id', '?'))}{role_badge}")
+            self.messages.append({"role": "system", "content": "\n".join(todo_lines)})
+
         for iteration in range(max_iterations):
             self.consume_mode_switches(stream_callback)
             if self._current_mode != "agent":
@@ -930,6 +864,25 @@ class AgentNimi:
             # We have a tool call
             tool_name = tool_call["tool"]
             tool_args = tool_call["args"]
+
+            # ── Tool diversity gate ───────────────────────────────────────────
+            recent_same_tool = [a for a in ledger.actions[-5:] if a.tool == tool_name]
+            if len(recent_same_tool) >= 2:
+                redirect_msg = (
+                    f"[DIVERSITY GATE] You have called '{tool_name}' {len(recent_same_tool)} times "
+                    "in the last 5 actions. This call is being blocked to prevent looping. "
+                    "You must try a DIFFERENT approach:\n"
+                    "  - Write a custom script with shell_exec\n"
+                    "  - Use searchsploit, curl, or wget to search online\n"
+                    "  - Pick a different tool from the Kali catalog\n"
+                    "  - Read an existing file or log for clues\n"
+                    "Do not attempt to call this tool again until you have tried something else."
+                )
+                self.messages.append({"role": "assistant", "content": response_text})
+                self.messages.append({"role": "user", "content": redirect_msg})
+                if stream_callback:
+                    stream_callback({"event": "tool_diversity_blocked", "tool": tool_name, "recent_count": len(recent_same_tool)})
+                continue  # skip to next iteration, let LLM rethink
 
             # ── Check if tool exists ──────────────────────────────────────
             if tool_name not in list_tools():
@@ -1040,47 +993,16 @@ class AgentNimi:
             if len(output) > 15000:
                 output = output[:15000] + "\n\n[...output truncated for context length...]"
 
-            # ── Vision-in-the-loop: describe screenshots via LLM (Phase 11+12) ─
-            _vision_cfg = self.config.get("vision", {})
-            _vision_enabled = _vision_cfg.get("enabled", True)
-            _auto_som = _vision_cfg.get("auto_describe_screenshots", True)
+            # ── Vision: describe screenshots via LLM (Phase 11) ──────────────
+            _vision_enabled = self.config.get("vision", {}).get("enabled", True)
             if _vision_enabled and tool_name == "browser_screenshot" and result["success"] and output.startswith("data:image"):
                 try:
-                    # ── Set-of-Marks: auto-annotate before vision analysis ────
-                    som_context = ""
-                    if _auto_som:
-                        try:
-                            from tools.browser_tools import browser_annotate
-                            sid = tool_args.get("session_id", "")
-                            if sid:
-                                som_result = browser_annotate(session_id=sid)
-                                if som_result and "[Set-of-Marks]" in som_result:
-                                    som_context = som_result
-                                    # Re-capture screenshot WITH the SoM overlays
-                                    from tools.browser_tools import browser_screenshot as _bs
-                                    annotated_shot = _bs(session_id=sid)
-                                    if annotated_shot.startswith("data:image"):
-                                        output = annotated_shot
-                                    # Clean up overlays for next interaction
-                                    from tools.browser_tools import browser_clear_marks
-                                    browser_clear_marks(session_id=sid)
-                        except Exception:
-                            pass  # SoM is a nice-to-have, don't fail the whole vision flow
-
                     vision_prompt = (
                         "Describe this browser screenshot in detail. "
                         "Identify visible UI elements, text content, URLs, form fields, "
                         "error messages, and anything security-relevant. "
                         "Be specific and thorough — your description will be used for further analysis."
                     )
-                    if som_context:
-                        vision_prompt += (
-                            "\n\nThe screenshot has numbered red markers (Set-of-Marks) "
-                            "overlaid on interactive elements. Here is the element map:\n"
-                            + som_context
-                            + "\n\nReference elements by their marker number [N] in your description."
-                        )
-
                     vision_messages = list(self.messages) + [
                         {"role": "assistant", "content": response_text},
                         {"role": "user", "content": vision_prompt},
@@ -1096,11 +1018,8 @@ class AgentNimi:
                             "event": "vision_description",
                             "session_id": tool_args.get("session_id", ""),
                             "description": description[:500],
-                            "som_elements": som_context[:300] if som_context else "",
                         })
                     output = f"[Screenshot captured — vision analysis]\n{description}"
-                    if som_context:
-                        output += f"\n\n{som_context}"
                 except Exception as _vision_err:
                     # Vision unavailable: fall back to noting the screenshot was captured
                     output = f"[Screenshot captured — vision analysis unavailable: {_vision_err}]\nRaw data URI length: {len(result['output'])} chars."
@@ -1138,12 +1057,7 @@ class AgentNimi:
             })
 
             # ── Reflection prompt ─────────────────────────────────────────────
-            reflection = ledger.reflection_prompt(
-                tool=tool_name,
-                args=tool_args,
-                success=result["success"],
-                output=result["output"],
-            )
+            reflection = ledger.reflection_prompt()
             self.messages.append({"role": "user", "content": reflection})
 
             if stream_callback:
@@ -1171,16 +1085,36 @@ class AgentNimi:
                     "unique_actions": len(ledger.unique_keys),
                     "consecutive_failures": ledger.consecutive_failures(),
                 })
-                self.messages.append({
-                    "role": "user",
-                    "content": (
-                        "[STALL DETECTED] Your recent actions are all repeats or failures. "
-                        "You MUST either try a completely different approach, "
-                        "or provide your best answer with what you have so far."
-                    ),
-                })
                 if stream_callback:
                     stream_callback({"event": "stall_detected", "iteration": iteration + 1})
+
+                # Pull fresh alternatives from the tool catalog
+                try:
+                    recent_tools = [a.tool for a in ledger.actions[-4:] if a.tool]
+                    used_str = ", ".join(set(recent_tools)) if recent_tools else "none"
+                    all_tools = list_tools()
+                    alternatives = [t for t in all_tools if t not in recent_tools][:8]
+                    alt_str = ", ".join(alternatives) if alternatives else "write a custom script"
+                    stall_injection = (
+                        f"[STALL DETECTED] You have been stuck using: {used_str}. "
+                        f"These have not solved the problem. "
+                        f"Available alternatives you have NOT tried: {alt_str}. "
+                        "You may also write a custom Python script using shell_exec, "
+                        "or search online with: "
+                        "shell_exec(command=\"curl 'https://cve.circl.lu/api/search/KEYWORD'\") "
+                        "or shell_exec(command=\"searchsploit KEYWORD\"). "
+                        "Choose a different path now."
+                    )
+                    self.messages.append({"role": "user", "content": stall_injection})
+                except Exception:
+                    self.messages.append({
+                        "role": "user",
+                        "content": (
+                            "[STALL DETECTED] Your recent actions are all repeats or failures. "
+                            "You MUST either try a completely different approach, "
+                            "or provide your best answer with what you have so far."
+                        ),
+                    })
 
             # ── Periodic progress summary ─────────────────────────────────────
             if (iteration + 1) % progress_interval == 0 and iteration + 1 < max_iterations:
@@ -1265,93 +1199,6 @@ class AgentNimi:
                 stream_callback(error_msg)
             return error_msg
 
-    def _safety_check(self, tool_name: str, args: dict) -> bool:
-        """Check if a tool call is safe to execute."""
-        blocked = self.safety.get("blocked_commands", [])
-
-        # Check tool name directly against blocklist (covers any tool type)
-        if tool_name in blocked:
-            return False
-
-        # For shell commands, also check the command string against each blocked pattern
-        if tool_name in ("shell_exec", "shell_exec_background"):
-            cmd = args.get("command", "")
-            for blocked_cmd in blocked:
-                if blocked_cmd in cmd:
-                    return False
-
-            # Block commands that would disconnect the network (failsafe)
-            if self.safety.get("block_network_disconnect", True):
-                if is_network_disconnect_command(cmd):
-                    audit_event("network_disconnect_blocked", {"command": cmd[:200]})
-                    return False
-
-        return True
-
-    # ─────────────────────────────────────────────────────────────────────
-    # Action classification & confirmation (Phase 5)
-    # ─────────────────────────────────────────────────────────────────────
-
-    def _needs_confirmation(self, tool_name: str) -> bool:
-        """Return True if the tool's action_class requires user confirmation."""
-        if not self.config.get("safety", {}).get("confirm_destructive", True):
-            return False
-        info = get_tool_info(tool_name)
-        if not info:
-            return False
-        manifest = info.get("manifest", {})
-        action_class = manifest.get("action_class", "read_only")
-        threshold = ACTION_CLASSES.get(
-            self.config.get("safety", {}).get("confirm_threshold", "irreversible"),
-            2,
-        )
-        return ACTION_CLASSES.get(action_class, 0) >= threshold
-
-    def _request_confirmation(self, tool_name: str, tool_args: dict, stream_callback=None) -> bool:
-        """Request user confirmation for a destructive action.
-
-        In web mode (stream_callback present): emit an SSE event and wait on
-        the confirmation queue with a timeout.
-        Returns True if confirmed, False otherwise.
-        """
-        info = get_tool_info(tool_name)
-        manifest = info.get("manifest", {}) if info else {}
-        action_class = manifest.get("action_class", "unknown")
-
-        confirm_timeout = self.config.get("safety", {}).get("confirm_timeout", 60)
-
-        if stream_callback:
-            stream_callback({
-                "event": "confirm_request",
-                "tool": tool_name,
-                "args": {k: str(v)[:200] for k, v in (tool_args or {}).items()},
-                "action_class": action_class,
-                "timeout": confirm_timeout,
-            })
-            # Wait for confirmation on the steer queue
-            try:
-                msg = self._steer_queue.get(timeout=confirm_timeout)
-                return str(msg).strip().lower() in ("yes", "y", "confirm", "approved", "ok")
-            except queue.Empty:
-                # Timeout — treat as declined
-                if stream_callback:
-                    stream_callback({"event": "confirm_timeout", "tool": tool_name})
-                return False
-        else:
-            # CLI / non-interactive: auto-approve (safety check already passed)
-            return True
-
-    def _drain_steer_messages(self, stream_callback=None):
-        """Pull all pending steer messages and append to conversation."""
-        while True:
-            try:
-                msg = self._steer_queue.get_nowait()
-                self.messages.append({"role": "user", "content": f"[OPERATOR STEERING]: {msg}"})
-                if stream_callback:
-                    stream_callback({"event": "steer_ack", "message": msg})
-            except queue.Empty:
-                break
-
     def _log_command(self, tool_name: str, args: dict, result: dict):
         """Log a tool execution."""
         if not self.config.get("logging", {}).get("enabled", True):
@@ -1420,66 +1267,6 @@ class AgentNimi:
             f"Tools executed: {len(self.command_log)}\n"
             f"Provider: {self.provider.name()}"
         )
-
-    # ─────────────────────────────────────────────────────────────────────
-    # Working Memory Management (Phase 2.3)
-    # ─────────────────────────────────────────────────────────────────────
-
-    @staticmethod
-    def _estimate_tokens(msg: dict) -> int:
-        """Rough token estimate: ~1.3 tokens per word."""
-        content = msg.get("content", "")
-        return int(len(content.split()) * 1.3)
-
-    def _manage_context_window(self):
-        """Keep self.messages within the token budget.
-
-        Strategy: keep system prompt + last 8 messages intact.
-        If over budget, summarise the middle section into a single
-        condensed message.
-        """
-        total = sum(self._estimate_tokens(m) for m in self.messages)
-        if total <= self._max_context_tokens:
-            return  # within budget
-
-        if len(self.messages) <= 10:
-            return  # too few messages to summarise
-
-        system = self.messages[0]
-        recent = self.messages[-8:]  # keep last 4 exchanges
-        middle = self.messages[1:-8]
-
-        if not middle:
-            return
-
-        # Heuristic summarisation (no LLM call — just compress)
-        summary_parts = []
-        for msg in middle:
-            role = msg.get("role", "")
-            content = msg.get("content", "")
-            # Keep first 120 chars of each message
-            snippet = content[:120].replace("\n", " ").strip()
-            if len(content) > 120:
-                snippet += "..."
-            if role == "user" and not content.startswith("["):
-                summary_parts.append(f"User: {snippet}")
-            elif role == "assistant" and len(content) > 30:
-                summary_parts.append(f"Agent: {snippet}")
-            # Skip tool results and system messages in summary
-
-        if summary_parts:
-            compressed = "\n".join(summary_parts[-15:])  # keep last 15 entries
-            summary_msg = {
-                "role": "system",
-                "content": f"[CONTEXT SUMMARY — earlier conversation compressed]\n{compressed}",
-            }
-            self.messages = [system, summary_msg] + recent
-            audit_event("context_compressed", {
-                "original_messages": len(middle) + len(recent) + 1,
-                "after_messages": len(self.messages),
-                "estimated_tokens_before": total,
-                "estimated_tokens_after": sum(self._estimate_tokens(m) for m in self.messages),
-            })
 
     # ─────────────────────────────────────────────────────────────────────
     # Smart Router helpers

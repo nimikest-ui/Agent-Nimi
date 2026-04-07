@@ -213,7 +213,7 @@ def _has_findings(result: str) -> bool:
 
 RECON_WORKFLOW = Workflow(
     name="recon",
-    description="Full reconnaissance pipeline: enumerate → OSINT enrich → analyze → report",
+    description="Full reconnaissance pipeline: enumerate → analyze → report",
     steps=[
         WorkflowStep(
             name="enumerate",
@@ -223,19 +223,6 @@ RECON_WORKFLOW = Workflow(
                 "Gather as much information as possible about the target."
             ),
             tools_allowed=["nmap_scan", "shell_exec", "file_read"],
-            gate=_not_empty,
-        ),
-        WorkflowStep(
-            name="osint_enrich",
-            prompt_template=(
-                "Enrich these recon results with OSINT data. For each discovered "
-                "service/version, run cve_lookup. Run whois_lookup on the target "
-                "domain/IP. Use web_search to find known issues, default creds, "
-                "or advisories. Use github_search if any custom software is detected.\n\n"
-                "{context}"
-            ),
-            tools_allowed=["web_search", "cve_lookup", "github_search", "whois_lookup",
-                           "shodan_host", "searchsploit", "shell_exec"],
             gate=_not_empty,
         ),
         WorkflowStep(
@@ -268,12 +255,10 @@ EXPLOIT_WORKFLOW = Workflow(
             name="research",
             prompt_template=(
                 "Research known vulnerabilities and exploits for the following "
-                "target/service. Use cve_lookup for specific CVE IDs, web_search for "
-                "advisories and PoCs, github_search for exploit code, and searchsploit "
-                "for local Exploit-DB matches:\n\n{context}"
+                "target/service. Check CVEs, exploit databases, and known attack "
+                "patterns:\n\n{context}"
             ),
-            tools_allowed=["searchsploit", "shell_exec", "file_read",
-                           "web_search", "cve_lookup", "github_search"],
+            tools_allowed=["searchsploit", "shell_exec", "file_read"],
             gate=_has_findings,
         ),
         WorkflowStep(

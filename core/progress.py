@@ -131,26 +131,37 @@ class ProgressLedger:
             parts.append("WARNING: You appear stalled — recent actions are all repeats or failures. Try a different approach.")
         return " ".join(parts)
 
-    def reflection_prompt(self, tool: str, args: dict, success: bool, output: str) -> str:  # noqa: E501
-        """Build a reflection prompt after a tool execution."""
-        status = "succeeded" if success else "FAILED"
-        snippet = output[:300].replace("\n", " ")
+    def reflection_prompt(self) -> str:
+        """Build a reflection prompt based on recent action history."""
+        recent = [a.tool for a in self.actions[-6:] if a.tool]
+        counts: dict[str, int] = {}
+        for t in recent:
+            counts[t] = counts.get(t, 0) + 1
+        repeated = [t for t, n in counts.items() if n >= 2]
 
-        lines = [
-            f"[REFLECT] Last action: {tool}({json.dumps(args, default=str)[:200]}) → {status}.",
-            f"Output snippet: {snippet}",
-        ]
+        base = "Reflect on your last action. Was it useful? Did it move you closer to the goal?\n"
 
-        if not success:
-            lines.append("Consider: What went wrong? Is there an alternative tool or different arguments to try?")
-
-        if self.is_repeated(tool, args):
-            lines.append(
-                "⚠ You have already tried this exact action before. "
-                "You MUST try a different approach or explain why this sub-goal is unachievable."
+        if repeated:
+            tools_str = ", ".join(repeated)
+            base += (
+                f"\nWARNING: You have called [{tools_str}] multiple times already. "
+                "Do NOT call these again unless you have a fundamentally different argument. "
+                "Instead, consider:\n"
+                "  - Writing a custom Python or Bash script with shell_exec\n"
+                "  - Searching online (curl to an API, searchsploit, or wget a resource)\n"
+                "  - Using a completely different Kali tool you have not tried yet\n"
+                "  - Reading a file or log that might contain the answer already\n"
+                "Pick ONE of the above. Do not fall back to your default tools."
             )
 
-        return "\n".join(lines)
+        if self.is_stalled():
+            base += (
+                "\nCRITICAL: You are stalled. Your last actions have been repetitive or failed. "
+                "Stop and think differently. Write code. Search online. Read the man page. "
+                "Try a tool from a completely different category."
+            )
+
+        return base
 
 
 # ── OuterTaskLedger (Phase 15) ────────────────────────────────────────────────

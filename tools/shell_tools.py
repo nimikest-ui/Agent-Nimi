@@ -172,13 +172,7 @@ _watchdog = _NetworkWatchdog()
 
 
 def start_network_watchdog(config: dict | None = None) -> None:
-    """Start the watchdog using config from the safety section.
-
-    Safe to call multiple times — configure + start is a no-op if the
-    watchdog thread is already running.
-    """
-    if _watchdog._thread and _watchdog._thread.is_alive():
-        return  # Already running — skip reconfiguring
+    """Start the watchdog using config from the safety section."""
     safety = (config or {}).get("safety", {})
     _watchdog.configure(
         enabled=safety.get("network_watchdog", True),
