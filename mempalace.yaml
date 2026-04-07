@@ -1,0 +1,18 @@
+wing: agent_nimi
+rooms:
+- name: providers
+  description: Files from providers/
+- name: chrome_extension
+  description: Files from chrome-extension/
+- name: agentred
+  description: Files from agentred/
+- name: web
+  description: Files from web/
+- name: scripts
+  description: Files from tools/
+- name: core
+  description: Files from core/
+- name: backend
+  description: Files from services/
+- name: general
+  description: Files that don't fit other rooms
