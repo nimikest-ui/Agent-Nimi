@@ -34,7 +34,7 @@ class MemoryMixin:
             return
 
         system = self.messages[0]
-        recent = self.messages[-8:]
+        recent = self.messages[-50:]
         middle = self.messages[1:-8]
 
         if not middle:

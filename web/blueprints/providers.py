@@ -97,16 +97,23 @@ def list_models():
         {"name": "grok-vision-beta", "provider": "grok"},
     ]
     
-    # Copilot models
+    # Copilot models (current as of 2026-04; gpt-4o removed — not available via CLI --model flag)
     models_by_provider["copilot"] = [
-        {"name": "gpt-4.1", "provider": "copilot"},
-        {"name": "gpt-4o", "provider": "copilot"},
-        {"name": "gpt-5-mini", "provider": "copilot"},
-        {"name": "claude-haiku-4.5", "provider": "copilot"},
+        {"name": "spectre",          "provider": "copilot"},  # persona pseudo-model
+        {"name": "gpt-4.1",          "provider": "copilot"},
+        {"name": "gpt-5-mini",        "provider": "copilot"},
+        {"name": "gpt-5.2",           "provider": "copilot"},
+        {"name": "gpt-5.2-codex",     "provider": "copilot"},
+        {"name": "gpt-5.3-codex",     "provider": "copilot"},
+        {"name": "gpt-5.4",           "provider": "copilot"},
+        {"name": "gpt-5.4-mini",      "provider": "copilot"},
+        {"name": "claude-haiku-4.5",  "provider": "copilot"},
+        {"name": "claude-sonnet-4",   "provider": "copilot"},
         {"name": "claude-sonnet-4.5", "provider": "copilot"},
         {"name": "claude-sonnet-4.6", "provider": "copilot"},
-        {"name": "gpt-5.2", "provider": "copilot"},
-        {"name": "gpt-5.3-codex", "provider": "copilot"},
+        {"name": "claude-opus-4.5",   "provider": "copilot"},
+        {"name": "claude-opus-4.6",   "provider": "copilot"},
+        {"name": "gemini-2.5-pro",    "provider": "copilot"},
     ]
     
     return jsonify(models_by_provider)
@@ -140,6 +147,9 @@ def get_status():
     
     result = {
         "provider": provider_info,
+        "default_provider": state.config.get("default_provider", ""),
+        "current_model": provider_info.get("model", "") if provider_info else "",
+        "connected": provider_info.get("connected", False) if provider_info else False,
         "history": history_summary,
         "monitor": {
             "running": state.monitor.is_running if state.monitor else False,

@@ -162,6 +162,17 @@ document.addEventListener('DOMContentLoaded', () => {
       // Clean up the URL so refreshing doesn't re-trigger the load.
       const cleanUrl = window.location.pathname;
       window.history.replaceState({}, '', cleanUrl);
+      return;
+    }
+    // Restore last active conversation across page reloads / server restarts.
+    const lastId = localStorage.getItem('lastConvId');
+    if (lastId) {
+      const exists = [...document.querySelectorAll('.conv-item')].some(el => el.dataset.id === lastId);
+      if (exists) {
+        switchConversation(lastId);
+      } else {
+        localStorage.removeItem('lastConvId');
+      }
     }
   });
   loadRouterStatus();
@@ -325,16 +336,14 @@ async function newChat() {
     document.getElementById('btn-send').style.display = '';
     document.getElementById('btn-stop').classList.remove('visible');
   }
-  try {
-    const r = await fetch('/api/conversations', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({title:'New Chat'})});
-    const data = await r.json();
-    currentConvId = data.id;
-    document.getElementById('messages').innerHTML = '';
-    document.getElementById('welcome').style.display = '';
-    document.getElementById('topbar-title').textContent = 'New Chat';
-    await loadConversations();
-    document.getElementById('user-input')?.focus();
-  } catch(e) {}
+  // Don't create a file yet — wait until user actually sends a message.
+  currentConvId = null;
+  localStorage.removeItem('lastConvId');
+  document.getElementById('messages').innerHTML = '';
+  document.getElementById('welcome').style.display = '';
+  document.getElementById('topbar-title').textContent = 'New Chat';
+  document.querySelectorAll('.conv-item').forEach(el => el.classList.remove('active'));
+  document.getElementById('user-input')?.focus();
 }
 
 async function switchConversation(id) {
@@ -355,6 +364,7 @@ async function switchConversation(id) {
     const data = await r.json();
     const conv = data.conversation || data;
     currentConvId = id;
+    localStorage.setItem('lastConvId', id);
     document.getElementById('topbar-title').textContent = conv.title || 'Chat';
     const msgs = document.getElementById('messages');
     msgs.innerHTML = '';
@@ -493,6 +503,7 @@ async function sendMessage() {
       const r = await fetch('/api/conversations', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({title: text.slice(0,40)})});
       const d = await r.json();
       currentConvId = d.id;
+      localStorage.setItem('lastConvId', d.id);
       document.getElementById('topbar-title').textContent = text.slice(0,40);
     } catch(e) {}
   }
@@ -898,7 +909,10 @@ function handleEvent(ev) {
       addPill('thinking-pill', '&#x2139; ' + escapeHtml(ev.message || 'streaming notice'), ev);
       break;
   }
-  if (ev.conversation_id && !currentConvId) currentConvId = ev.conversation_id;
+  if (ev.conversation_id && !currentConvId) {
+    currentConvId = ev.conversation_id;
+    localStorage.setItem('lastConvId', ev.conversation_id);
+  }
 }
 
 // ── Pill detail panel (click to expand) ───────────────────────────────────
@@ -1416,14 +1430,26 @@ function copyTerminalOutput(btn) {
 // Models: string = no price info, {v,l} = {api value, display label}
 const MODELS = {
   copilot: [
-    {v:'gpt-4.1',             l:'gpt-4.1  included'},
-    {v:'gpt-4o',              l:'gpt-4o  included'},
-    {v:'gpt-5-mini',          l:'gpt-5-mini  included'},
+    // Persona
+    {v:'spectre',             l:'⚡ Spectre  hacker mode'},
+    // OpenAI — free tier (0x multiplier)
+    {v:'gpt-4.1',             l:'gpt-4.1  free'},
+    {v:'gpt-5-mini',          l:'gpt-5-mini  free'},
+    // OpenAI — premium (1x)
+    {v:'gpt-5.2',             l:'gpt-5.2  1x'},
+    {v:'gpt-5.2-codex',       l:'gpt-5.2-codex  1x'},
+    {v:'gpt-5.3-codex',       l:'gpt-5.3-codex  1x'},
+    {v:'gpt-5.4',             l:'gpt-5.4  1x'},
+    {v:'gpt-5.4-mini',        l:'gpt-5.4-mini  0.33x'},
+    // Anthropic
     {v:'claude-haiku-4.5',    l:'claude-haiku-4.5  0.33x'},
+    {v:'claude-sonnet-4',     l:'claude-sonnet-4  1x'},
     {v:'claude-sonnet-4.5',   l:'claude-sonnet-4.5  1x'},
     {v:'claude-sonnet-4.6',   l:'claude-sonnet-4.6  1x'},
-    {v:'gpt-5.2',             l:'gpt-5.2  1x'},
-    {v:'gpt-5.3-codex',       l:'gpt-5.3-codex  1x'},
+    {v:'claude-opus-4.5',     l:'claude-opus-4.5  3x'},
+    {v:'claude-opus-4.6',     l:'claude-opus-4.6  3x'},
+    // Google
+    {v:'gemini-2.5-pro',      l:'gemini-2.5-pro  1x'},
   ],
   grok: [
     {v:'grok-4.20',                    l:'grok-4.20  $2/$6'},
@@ -1443,6 +1469,18 @@ const MODELS = {
     {v:'grok-vision-beta',             l:'grok-vision-beta'},
     {v:'grok-beta',                    l:'grok-beta'},
   ],
+  groq: [
+    {v:'moonshotai/kimi-k2-instruct',  l:'Kimi K2  free'},
+    {v:'llama-3.3-70b-versatile',      l:'Llama 3.3 70B  $0.59/$0.79'},
+    {v:'llama-3.1-8b-instant',         l:'Llama 3.1 8B Instant  $0.05/$0.08'},
+    {v:'llama-3.3-70b-specdec',        l:'Llama 3.3 70B SpecDec  $0.59/$0.99'},
+    {v:'deepseek-r1-distill-llama-70b',l:'DeepSeek-R1 70B  $0.75/$0.99'},
+    {v:'qwen-qwq-32b',                 l:'Qwen QwQ 32B  $0.29/$0.39'},
+    {v:'mixtral-8x7b-32768',           l:'Mixtral 8x7B  $0.24/$0.24'},
+    {v:'gemma2-9b-it',                 l:'Gemma2 9B  $0.20/$0.20'},
+    {v:'compound-beta',                l:'Compound Beta'},
+    {v:'compound-beta-mini',           l:'Compound Beta Mini'},
+  ],
 };
 
 // Render <option> tags for a model array (strings or {v,l} objects)
@@ -1455,7 +1493,7 @@ function modelOpts(arr) {
 }
 
 // ── Provider Cards with Enable/Disable Toggle ─────────────────────────────
-const PROVIDER_LABELS = {grok: 'Grok · xAI', copilot: 'GitHub Copilot'};
+const PROVIDER_LABELS = {grok: 'Grok · xAI', groq: 'Groq', copilot: 'GitHub Copilot'};
 
 async function loadProviderCards() {
   const container = document.getElementById('provider-cards');
@@ -1501,8 +1539,7 @@ function selectProvider(prov) {
   document.querySelectorAll('.provider-card').forEach(c => {
     c.classList.toggle('active', c.dataset.provider === prov && !c.classList.contains('disabled'));
   });
-  // Close provider panel as confirmation
-  collapseSettings('provider');
+  // Do NOT close panel — user still needs to pick a model
 }
 
 async function toggleProviderEnabled(providerName, event) {
@@ -1632,6 +1669,7 @@ async function loadStatus() {
 function inferProviderKey(name) {
   const text = String(name || '').toLowerCase();
   if (text.includes('copilot')) return 'copilot';
+  if (text.includes('groq')) return 'groq';
   if (text.includes('grok')) return 'grok';
   return '';
 }

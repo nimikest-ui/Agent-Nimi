@@ -3,6 +3,7 @@ import uuid
 import datetime
 from flask import Blueprint, jsonify, request
 from web.services import conversation_service
+from web.services.conversation_service import commit_conversation_to_memory
 from web.utils import state
 from config import SYSTEM_PROMPT
 from core.session_memory import clear_engagement
@@ -62,32 +63,44 @@ def update_conversation(conv_id):
 
 @conversations_bp.route('/<conv_id>', methods=['DELETE'])
 def delete_conversation(conv_id):
-    """Remove a conversation from recents while preserving an archived copy."""
-    success = conversation_service.archive_conversation(conv_id)
-    if not success:
+    """Remove a conversation from recents, commit to memory if it had content."""
+    conv = conversation_service.load_conversation(conv_id)
+    if not conv:
         return jsonify({"error": "Not found"}), 404
-    
+
+    commit_conversation_to_memory(conv)
+    conversation_service.archive_conversation(conv_id)
+
     if state.current_conv_id == conv_id:
         state.set_current_conv_id(None)
     state.cancel_conv(conv_id, timeout=3.0)
     state.remove_agent(conv_id)
     clear_engagement(conv_id)
-    
+
     return jsonify({"success": True, "archived": True})
 
 
 @conversations_bp.route('/clear', methods=['POST'])
 def clear_recent_conversations():
-    """Archive all recent conversations and clear the recent list."""
+    """Archive all recent conversations (memory committed first)."""
+    import json as _json
+    for p in list(conversation_service.CONV_DIR.glob("*.json")):
+        try:
+            with open(p) as _f:
+                _conv = _json.load(_f)
+            commit_conversation_to_memory(_conv)
+        except Exception:
+            pass
+
     archived_ids = conversation_service.clear_recent_conversations()
-    
+
     if state.current_conv_id in archived_ids:
         state.set_current_conv_id(None)
     for conv_id in archived_ids:
         state.cancel_conv(conv_id, timeout=2.0)
         state.remove_agent(conv_id)
         clear_engagement(conv_id)
-    
+
     return jsonify({"success": True, "archived_count": len(archived_ids)})
 
 

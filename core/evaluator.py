@@ -332,7 +332,13 @@ class AutoEvaluator:
 
         # ── Length: bell-curve scoring (peak at ideal_words) ──────────────
         words = len(response.split())
-        ideal = 150 if task_type in self._CODE_TASKS else 400
+        # "general" = conversational/clarifying exchange; short replies are fine
+        if task_type in self._CODE_TASKS:
+            ideal = 150
+        elif task_type == "general":
+            ideal = 60
+        else:
+            ideal = 400
         if words == 0:
             score -= 0.25
             issues.append("empty_response")
@@ -341,7 +347,12 @@ class AutoEvaluator:
             ratio = (words - ideal) / max(ideal, 1)
             length_bonus = 0.20 * math.exp(-(ratio ** 2))  # raised 0.15→0.20 for better score resolution
             score += length_bonus
-            if words < 15:
+            # Only penalise short replies on action/code tasks — not conversational ones
+            action_tasks_with_length = {"recon", "scan", "exploit", "password", "privesc", "web",
+                                        "sysadmin", "code", "debug", "refactor", "test",
+                                        "architecture", "yara_sigma", "malware_re",
+                                        "exploit_chain", "ir_report"}
+            if words < 15 and task_type in action_tasks_with_length:
                 score -= 0.15
                 issues.append("response_too_short")
 

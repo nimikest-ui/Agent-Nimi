@@ -29,12 +29,17 @@ def init_agent(provider_name: str = None):
     pname = provider_name or chosen
     agent = AgentNimi(pname, config)
     
-    # Handle copilot provider model normalization
+    # Handle copilot provider model normalization — but only when the saved
+    # model is empty or not a recognized persona (e.g. "spectre").  Never
+    # overwrite a persona name with its underlying real model.
     if pname == "copilot":
-        normalized = getattr(agent.provider, "model", "")
-        if normalized and config["providers"].setdefault("copilot", {}).get("model") != normalized:
-            config["providers"]["copilot"]["model"] = normalized
-            save_config(config)
+        from providers.copilot_provider import CopilotProvider
+        saved_model = config["providers"].setdefault("copilot", {}).get("model", "")
+        if saved_model not in CopilotProvider._PERSONAS:
+            normalized = getattr(agent.provider, "model", "")
+            if normalized and saved_model != normalized:
+                config["providers"]["copilot"]["model"] = normalized
+                save_config(config)
     
     state.set_agent(agent)
     state.set_config(config)
@@ -93,9 +98,13 @@ def get_provider_info():
     if not state.agent:
         return None
     
+    # Return the model name as stored in config (preserves persona names like
+    # "spectre" instead of returning the normalized underlying model).
+    default_prov = state.config.get("default_provider", "")
+    config_model = state.config.get("providers", {}).get(default_prov, {}).get("model", "")
     return {
         "name": state.agent.provider.name(),
         "connected": state.agent.provider.test_connection(),
-        "model": state.agent.provider.model,
+        "model": config_model or getattr(state.agent.provider, "model", ""),
         "routing_active": state.agent.routing_active if hasattr(state.agent, 'routing_active') else False,
     }

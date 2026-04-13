@@ -4,6 +4,8 @@ import datetime
 from pathlib import Path
 from typing import Optional
 
+from core.episodic_memory import Episode, EPISODES_FILE, EPISODES_DIR
+
 CONV_DIR = Path.home() / ".agent-nimi" / "conversations"
 ARCHIVE_DIR = Path.home() / ".agent-nimi" / "conversation_archive"
 CONV_DIR.mkdir(parents=True, exist_ok=True)
@@ -62,12 +64,17 @@ def load_conversation(conv_id: str) -> Optional[dict]:
 
 
 def list_conversations() -> list[dict]:
-    """List all saved conversations."""
+    """List all saved conversations, pruning empty orphans on the fly."""
     convs = []
     for p in CONV_DIR.glob("*.json"):
         try:
             with open(p) as f:
                 data = json.load(f)
+            # Silently delete empty conversations created by newChat() that
+            # never received a message (e.g. from page reloads or old code).
+            if not data.get("messages"):
+                p.unlink(missing_ok=True)
+                continue
             convs.append({
                 "id": data.get("id", p.stem),
                 "title": data.get("title", "Untitled"),
@@ -107,6 +114,42 @@ def archive_conversation(conv_id: str) -> bool:
     with open(_archive_path(conv_id), "w") as f:
         json.dump(archived, f, indent=2)
     return delete_conversation(conv_id)
+
+
+def commit_conversation_to_memory(conv: dict) -> bool:
+    """Append a lightweight episode to episodic memory if the conversation had content."""
+    messages = conv.get("messages", [])
+    user_msgs = [m.get("content", "") for m in messages if m.get("role") == "user"]
+    asst_msgs = [m.get("content", "") for m in messages if m.get("role") == "assistant"]
+    if not user_msgs:
+        return False
+    task_summary = _snippet(user_msgs[0], 120)
+    last_reply = _snippet(asst_msgs[-1], 220) if asst_msgs else ""
+    episode = Episode(
+        timestamp=datetime.datetime.now().isoformat(),
+        task_summary=task_summary,
+        task_type="general",
+        strategy="direct",
+        tools_used=[],
+        provider_model=conv.get("provider_model", "unknown"),
+        outcome="success" if asst_msgs else "partial",
+        quality_score=1.0 if asst_msgs else 0.5,
+        lessons=[],
+        keywords=[w.lower() for w in task_summary.split() if len(w) > 3][:10],
+    )
+    # Store extra fields not in the dataclass by wrapping manually
+    import dataclasses, json as _json
+    record = dataclasses.asdict(episode)
+    record["conversation_title"] = conv.get("title", "")
+    record["last_assistant_message"] = last_reply
+    record["message_count"] = len(messages)
+    try:
+        EPISODES_DIR.mkdir(parents=True, exist_ok=True)
+        with open(EPISODES_FILE, "a") as f:
+            f.write(_json.dumps(record) + "\n")
+        return True
+    except OSError:
+        return False
 
 
 def clear_recent_conversations() -> list[str]:

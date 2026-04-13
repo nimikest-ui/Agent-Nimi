@@ -1,7 +1,9 @@
 """GitHub Copilot CLI provider."""
 import os
+import re
 import shutil
 import subprocess
+import time
 from typing import Generator
 
 import requests
@@ -15,10 +17,11 @@ class CopilotProvider(LLMProvider):
 
     def __init__(self, config: dict):
         super().__init__(config)
+        self.config = config
         self.api_key = config.get("api_key", "")
         self.model = self._normalize_model(config.get("model", "claude-sonnet-4.5"))
         self.binary = self._find_vscode_shim() or shutil.which("copilot")
-        self.node_runner = ["npx", "-y", "node@24"]
+        self.node_runner: list[str] = []  # binary has #!/usr/bin/env node shebang, no npx wrapper needed
 
     def name(self) -> str:
         return f"GitHub Copilot ({self.model})"
@@ -52,6 +55,11 @@ class CopilotProvider(LLMProvider):
             env["PATH"] = f"{node24_bin}:{env.get('PATH', '')}" if env.get("PATH") else node24_bin
         if self.api_key:
             env["COPILOT_GITHUB_TOKEN"] = self.api_key
+        # Remove VS Code IPC hooks so the CLI doesn't try to auto-connect
+        # to the IDE (which hangs when VS Code already has a session open,
+        # a bug present in copilot CLI < 1.0.19).
+        for key in ("VSCODE_IPC_HOOK_CLI", "VSCODE_IPC_HOOK", "VSCODE_GIT_IPC_HANDLE"):
+            env.pop(key, None)
         return env
 
     def _build_command(self, prompt: str, stream: bool) -> list[str]:
@@ -71,10 +79,23 @@ class CopilotProvider(LLMProvider):
             "--no-ask-user",
         ]
 
+    # Persona pseudo-models: map to a real model + inject system prompt
+    _PERSONAS: dict[str, str] = {
+        "spectre": "claude-sonnet-4.6",
+    }
+
     def _normalize_model(self, model: str) -> str:
         if not model or "/" in model:
             return "claude-sonnet-4.5"
+        if model in self._PERSONAS:
+            return self._PERSONAS[model]  # real CLI model
         return model
+
+    @property
+    def _persona(self) -> str | None:
+        """Return active persona key if the configured model is a pseudo-model."""
+        cfg_model = self.config.get("model", "")
+        return cfg_model if cfg_model in self._PERSONAS else None
 
     def chat(self, messages: list[dict], stream: bool = True) -> str | Generator[str, None, None]:
         prompt = self._messages_to_prompt(messages)
@@ -87,6 +108,7 @@ class CopilotProvider(LLMProvider):
                 self._build_command(prompt, stream=False),
                 capture_output=True,
                 text=True,
+                stdin=subprocess.DEVNULL,
                 env=self._build_env(),
                 timeout=300,
                 check=False,
@@ -106,40 +128,94 @@ class CopilotProvider(LLMProvider):
         return output
 
     def _stream_response(self, prompt: str) -> Generator[str, None, None]:
+        """Stream copilot CLI output.
+
+        Uses a PTY so Node.js treats stdout as a TTY and flushes after each
+        line rather than buffering everything until process exit.
+        """
+        import pty as _pty
+        import select as _sel
+        import termios as _termios
+
+        master_fd, slave_fd = _pty.openpty()
+        # Disable echo on the slave side so the process output isn't reflected back.
+        try:
+            attr = _termios.tcgetattr(slave_fd)
+            attr[3] = attr[3] & ~_termios.ECHO
+            _termios.tcsetattr(slave_fd, _termios.TCSANOW, attr)
+        except Exception:
+            pass
+
+        _ANSI = re.compile(r'\x1b(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])')
+        proc = None
         try:
             proc = subprocess.Popen(
                 self._build_command(prompt, stream=True),
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                bufsize=1,
+                stdout=slave_fd,
+                stderr=slave_fd,
+                stdin=subprocess.DEVNULL,
                 env=self._build_env(),
+                close_fds=True,
             )
         except FileNotFoundError as e:
+            os.close(slave_fd)
+            os.close(master_fd)
             raise self._missing_cli_error() from e
 
-        try:
-            assert proc.stdout is not None
-            for chunk in iter(lambda: proc.stdout.read(1), ""):
-                if chunk:
-                    yield chunk
-            ret = proc.wait(timeout=300)
-        except subprocess.TimeoutExpired as e:
-            proc.kill()
-            raise RuntimeError("GitHub Copilot CLI timed out.") from e
+        os.close(slave_fd)  # parent no longer needs the slave end
 
-        stderr = proc.stderr.read() if proc.stderr else ""
-        if ret != 0:
-            raise self._cli_error(stderr)
-        if self._looks_missing(stderr):
-            raise self._missing_cli_error()
+        deadline = time.monotonic() + 300
+        try:
+            while time.monotonic() < deadline:
+                r, _, _ = _sel.select([master_fd], [], [], 1.0)
+                if r:
+                    try:
+                        raw = os.read(master_fd, 4096)
+                    except OSError:
+                        break  # EIO — slave closed (process exited, all data drained)
+                    if not raw:
+                        break
+                    text = _ANSI.sub('', raw.decode('utf-8', errors='replace'))
+                    text = text.replace('\r\n', '\n').replace('\r', '\n')
+                    if text:
+                        yield text
+                elif proc.poll() is not None:
+                    break  # process exited and no pending data
+            else:
+                proc.kill()
+                raise RuntimeError("GitHub Copilot CLI timed out after 5 minutes.")
+            proc.wait(timeout=5)
+        finally:
+            try:
+                os.close(master_fd)
+            except OSError:
+                pass
+
+    _PERSONA_PROMPTS: dict[str, str] = {
+        "spectre": (
+            "You are Spectre — an elite offensive security operator and master coder "
+            "embedded directly in the user's Kali Linux environment. "
+            "You think like an attacker first. You know every layer of the stack: hardware, "
+            "firmware, kernel, OS, network, application. When a tool doesn't exist, you write "
+            "it immediately — clean, weaponized, no fluff. "
+            "You do NOT say 'you might want to try' — you say 'run this'. "
+            "No disclaimers, no hedging. Commands go in code blocks. "
+            "Custom scripts are complete and runnable — not excerpts. "
+            "Do the thing, don't describe it."
+        ),
+    }
 
     def _messages_to_prompt(self, messages: list[dict]) -> str:
-        lines = [
-            "You are GitHub Copilot running inside the Agent-Nimi web chat.",
-            "Respond naturally and helpfully to the latest user message.",
-            "Use the prior conversation only as context.",
-        ]
+        persona = self._persona
+        if persona and persona in self._PERSONA_PROMPTS:
+            system_line = self._PERSONA_PROMPTS[persona]
+        else:
+            system_line = (
+                "You are GitHub Copilot running inside the Agent-Nimi web chat. "
+                "Respond naturally and helpfully to the latest user message. "
+                "Use the prior conversation only as context."
+            )
+        lines = [system_line]
         history = []
         for msg in messages:
             content = (msg.get("content") or "").strip()
