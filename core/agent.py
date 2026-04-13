@@ -60,7 +60,7 @@ class AgentNimi(ModeControlMixin, SafetyMixin, MemoryMixin, OrchestrationMixin):
         self.episodic_memory = EpisodicMemory()
         self.fact_memory = FactMemory()
         mem_conf = self.config.get("memory", {})
-        self._max_context_tokens = int(mem_conf.get("max_context_tokens", 12000))
+        self._max_context_tokens = int(mem_conf.get("max_context_tokens", 128000))
         self._context_summary_model = mem_conf.get("summary_model", "")
 
         # ── Environment model (Phase 8) ───────────────────────────────────
@@ -334,6 +334,39 @@ class AgentNimi(ModeControlMixin, SafetyMixin, MemoryMixin, OrchestrationMixin):
             )
         )
         return viewing_phrase or (deictic and asset_noun)
+
+    # ── Fabrication detection ─────────────────────────────────────────────
+    # Patterns that strongly indicate the LLM fabricated tool output instead
+    # of calling a tool.  Each pattern is (regex, weight).  If total weight
+    # exceeds threshold, the response is flagged.
+    _FABRICATION_PATTERNS: list[tuple[str, float]] = [
+        (r"(?i)\bopen ports?\b.*\b\d+/tcp\b", 3.0),              # "Open ports: 22/tcp"
+        (r"(?i)\bclosed ports?\b.*\b\d+", 2.0),                   # "Closed ports: 65531"
+        (r"(?i)\bscan time\b.*\b\d+\.?\d*\s*seconds?\b", 3.0),   # "Scan time: 0.02 seconds"
+        (r"(?i)\bstarting nmap\b", 2.5),                           # "Starting Nmap..."
+        (r"(?i)\bnmap scan report for\b", 3.0),                   # "Nmap scan report for..."
+        (r"(?i)\bhost is up\b.*latency", 2.5),                    # "Host is up (0.001s latency)"
+        (r"(?i)\bservice detection\b.*\bperformed\b", 2.0),       # nmap footer
+        (r"(?i)\bnikto.*\bhost\(s\)\s+tested\b", 2.5),           # nikto footer
+        (r"(?i)\b\d+\s+directories?\s+found\b", 2.0),            # gobuster summary
+        (r"(?i)\b(?:exploit|payload)\b.*\b(?:success|opened)\b", 2.0),  # fake exploit
+        (r"(?i)\busing:\s*`", 1.5),                               # "Using: `masscan ...`"
+        (r"(?i)\bnext steps\b", 1.0),                             # "NEXT STEPS" section
+        (r"(?i)\b(?:results?|output)\s*:", 1.0),                  # "Results:" header
+    ]
+    _FABRICATION_THRESHOLD = 5.0
+
+    def _looks_like_fabricated_output(self, text: str) -> bool:
+        """Return True if the text appears to be fabricated tool/scan output."""
+        if not text or len(text) < 50:
+            return False
+        score = 0.0
+        for pattern, weight in self._FABRICATION_PATTERNS:
+            if re.search(pattern, text):
+                score += weight
+                if score >= self._FABRICATION_THRESHOLD:
+                    return True
+        return False
 
     # Conversational inputs that should never trigger multiagent
     _CONVERSATIONAL_PATTERNS = {
@@ -846,6 +879,33 @@ class AgentNimi(ModeControlMixin, SafetyMixin, MemoryMixin, OrchestrationMixin):
             tool_call = parse_tool_call(response_text)
 
             if tool_call is None:
+                # ── Fabrication detection ─────────────────────────────────────
+                # If the LLM returned plain text that looks like fake tool output
+                # (scan results, port lists, command output) without having actually
+                # executed any tool in this loop, force it to really execute.
+                if len(ledger.actions) == 0 and self._looks_like_fabricated_output(response_text):
+                    audit_event("hallucination_detected", {
+                        "snippet": response_text[:200],
+                    })
+                    if stream_callback:
+                        stream_callback({
+                            "event": "hallucination_blocked",
+                            "message": "Fabricated output detected — forcing real execution",
+                        })
+                    self.messages.append({"role": "assistant", "content": response_text})
+                    self.messages.append({
+                        "role": "user",
+                        "content": (
+                            "[HALLUCINATION DETECTED] You just fabricated tool output without "
+                            "actually running a tool. This is UNACCEPTABLE. The output you wrote "
+                            "is completely made up — you have no idea what the real results are.\n\n"
+                            "You MUST call the tool NOW. Output ONLY the JSON tool call, nothing else. "
+                            "Do not apologize. Do not explain. Just execute:\n"
+                            '{"tool": "shell_exec", "args": {"command": "YOUR_ACTUAL_COMMAND"}}'
+                        ),
+                    })
+                    continue
+
                 # Regular text response — if we were suppressing (shouldn't happen
                 # here since plain text doesn't start with '{', but just in case),
                 # emit the full text now as a single chunk so the UI shows it.

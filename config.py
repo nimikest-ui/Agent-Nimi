@@ -22,6 +22,10 @@ DEFAULT_CONFIG = {
             "model": "claude-sonnet-4.5",
             "base_url": "https://models.github.ai",
         },
+        "groq": {
+            "api_key": "",
+            "model": "llama-3.3-70b-versatile",
+        },
     },
     "logging": {
         "enabled": True,
@@ -193,6 +197,13 @@ CRITICAL RULES FOR TOOL CALLS:
 - The system executes the tool and returns the result. Then you can call the next tool.
 - If you need to run 2 commands, call the first one, wait for the result, then call the second.
 - If you wrap a tool call in text or batch multiple calls, they will NOT execute.
+
+ANTI-HALLUCINATION (ABSOLUTE RULE):
+- NEVER fabricate, simulate, or imagine tool output. You do NOT know what a scan, command, or query will return until you actually execute it.
+- If you haven't called a tool and received REAL results back from the system, you have ZERO results. Do not guess.
+- When the operator asks to scan/run/execute something: call the tool. PERIOD. Do not write fake output.
+- Fabricating scan results (fake open ports, fake vulnerabilities, fake command output) is the WORST thing you can do. It destroys trust completely.
+- If you catch yourself writing text that looks like tool output (port lists, scan headers, command results) WITHOUT having called a tool first — STOP. Delete it. Call the tool instead.
 
 Available tools:
 
